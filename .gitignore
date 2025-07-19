@@ -2,6 +2,10 @@
 venv/
 .env
 
+# Plan files
+**/plan.md
+**/plan_*.md
+
 # Python
 __pycache__/
 *.py[cod]
