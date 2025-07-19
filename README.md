@@ -34,8 +34,10 @@ graph TD
     C --> F[Analyse Technique]
     D --> G[Gestion du Capital]
     E --> H[API Kraken]
-    I[Base de Données] <--> B
-    J[Cache Redis] <-> B
+    I[Base de Données] -- Lecture/Écriture --> B
+    B -- Lecture/Écriture --> I
+    J[Cache Redis] -- Lecture/Écriture --> B
+    B -- Lecture/Écriture --> J
 ```
 
 ## 🚀 Démarrage Rapide
