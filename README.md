@@ -1,16 +1,26 @@
-# Kraken Trading Bot 🤖
+# 🤖 Kraken Trading Bot
 
-[![Python](https://img.shields.io/badge/Python-3.12+-blue.svg)](https://www.python.org/)
+[![Python 3.12+](https://img.shields.io/badge/Python-3.12+-blue.svg)](https://www.python.org/)
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](https://opensource.org/licenses/MIT)
 [![Code style: black](https://img.shields.io/badge/code%20style-black-000000.svg)](https://github.com/psf/black)
-
----
+[![Documentation](https://img.shields.io/badge/docs-latest-brightgreen.svg)](#documentation)
+[![GitHub stars](https://img.shields.io/github/stars/yourusername/Kraken_Bot?style=social)](https://github.com/yourusername/Kraken_Bot)
 
 ## 📋 Présentation
-Kraken_Bot est une plateforme de trading algorithmique avancée pour la bourse Kraken, intégrant des stratégies de trading sophistiquées, de l'apprentissage automatique, une gestion avancée des risques et un monitoring complet. 
+Kraken_Bot est une plateforme de trading algorithmique avancée pour la bourse Kraken, intégrant des stratégies de trading sophistiquées, de l'apprentissage automatique, une gestion avancée des risques et un monitoring complet.
 
-- **Objectif** : Automatiser le trading sur Kraken avec des stratégies robustes, une gestion du risque professionnelle et des outils d’analyse avancés.
-- **Public visé** : Traders, développeurs, chercheurs, passionnés de finance quantitative.
+### 🎯 Objectifs
+- Automatisation du trading sur Kraken avec des stratégies robustes
+- Gestion professionnelle des risques
+- Analyse technique et prédictive avancée
+- Interface utilisateur intuitive
+- Architecture modulaire et extensible
+
+### 👥 Public visé
+- Traders algorithmiques
+- Développeurs Python
+- Chercheurs en finance quantitative
+- Passionnés de trading automatisé
 
 ---
 
@@ -222,3 +232,4 @@ Distribué sous licence MIT. Voir [LICENSE](LICENSE) pour plus d’informations.
 ---
 
 *Dernière mise à jour : 16 juillet 2024*
+# Kraken_Bot
