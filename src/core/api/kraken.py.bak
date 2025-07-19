@@ -1,0 +1,3884 @@
+"""
+Module d'API pour interagir avec l'API Kraken.
+"""
+
+# Imports standards
+import os
+from datetime import datetime
+from typing import (
+    Dict, Any, Optional, List, TypeVar, Generic, Callable,
+    Union, Tuple, TypedDict, Literal, Required, NotRequired
+)
+from collections import defaultdict
+
+# Imports asynchrones
+import aiohttp
+import asyncio
+
+# Imports locaux
+from .kraken_api.exceptions import KrakenAPIError, APIError, AuthenticationError, RateLimitError, ValidationError, APIConnectionError
+from .kraken_api.ratelimiter import RateLimiter
+from .kraken_api.cache import KrakenCache
+from .kraken_api.config import KrakenConfig
+from .kraken_api.websocket import KrakenWebSocket
+
+T = TypeVar('T')
+
+
+class KrakenAPI:
+    """Classe principale pour l'API Kraken."""
+
+    class OrderParams(TypedDict):
+        """Paramètres pour la création d'ordre."""
+        pair: Required[str]
+        type: Required[Literal['buy', 'sell']]
+        ordertype: Required[Literal['market',
+    'limit',
+    'stop-loss',
+    'take-profit',
+    'stop-loss-limit',
+     'take-profit-limit']]
+        price: NotRequired[float]
+        price2: NotRequired[float]
+        volume: Required[float]
+        leverage: NotRequired[str]
+        oflags: NotRequired[List[str]]
+        starttm: NotRequired[str]
+        expiretm: NotRequired[str]
+        userref: NotRequired[int]
+        validate: NotRequired[bool]
+        close: NotRequired[Dict]
+
+    class TradeHistoryParams(TypedDict):
+        """Paramètres pour l'historique des trades."""
+        type: NotRequired[Literal['all', 'any position',
+            'closed position', 'closing position', 'no position']]
+        trades: NotRequired[bool]
+        start: NotRequired[int]
+        end: NotRequired[int]
+        ofs: NotRequired[int]
+
+    def __init__(self, env: Optional[str] = None, config_file: Optional[str] = None,
+                 api_key: Optional[str] = None, api_secret: Optional[str] = None,
+                 loop: Optional[asyncio.AbstractEventLoop] = None,
+                 session_dir: Optional[str] = None):
+        """Initialise l'API Kraken."""
+        # Initialiser le gestionnaire de configuration
+        self.config = KrakenConfig(env=env, config_file=config_file)
+
+        # Configuration
+        self.base_url = self.config.get('base_url')
+        self.api_version = self.config.get('version')
+        self.timeout = self.config.get('timeout')
+        self.max_retries = self.config.get('max_retries')
+        self.retry_delay = self.config.get('retry_delay')
+        self.cache_ttl = self.config.get('cache_ttl')
+
+        # Configuration du logging
+        self.logger = logging.getLogger(__name__ + '.KrakenAPI')
+        self.logger.setLevel(self.config.get('log_level', 'INFO').upper())
+
+        # Initialiser l'event loop
+        self.loop = loop or asyncio.get_event_loop()
+
+        # Initialiser la session HTTP
+        self.session = aiohttp.ClientSession(
+            timeout=aiohttp.ClientTimeout(total=self.timeout),
+            connector=aiohttp.TCPConnector(ssl=True, loop=self.loop),
+            headers={
+                'User-Agent': f'KrakenAPI/1.0 (Python/{os.getenv("PYTHON_VERSION", "3.10")})',
+                'Accept': 'application/json'
+            }
+        )
+
+        # Authentification
+        credentials = self.config.get_credentials()
+        self.api_key = api_key if api_key is not None else credentials['api_key']
+        self.api_secret = api_secret if api_secret is not None else credentials['api_secret']
+
+        # Rate limiting
+        rate_limit = self.config.get_rate_limit()
+        self.rate_limit_enabled = rate_limit.get('enabled', True)
+        self.rate_limit_window = rate_limit.get('window', 30)
+        self.rate_limit_limit = rate_limit.get('limit', 50)
+        self.requests = defaultdict(int)
+        self.last_reset = time.time()
+
+        # Cache
+        self.cache = KrakenCache(ttl=self.cache_ttl)
+
+        # Mapping interne pair Kraken -> altname
+        self.pair_altname_map = None  # Rempli à la demande
+
+        # Initialisation des modules
+        self.websocket = KrakenWebSocket(self)
+
+    async def __aenter__(self):
+        """Initialise une session asynchrone."""
+        return self
+
+    async def __aexit__(self, exc_type, exc_val, exc_tb):
+        """Ferme la session asynchrone."""
+        await self.session.close()
+
+    async def _request(self,
+    method: str,
+    endpoint: str,
+    data: Optional[Dict[str,
+    Any]] = None,
+     private: bool = False):
+        """
+        Effectue une requête à l'API Kraken avec gestion des retries et métriques.
+
+        Args:
+            method: Méthode HTTP (GET, POST, PUT, DELETE)
+            endpoint: Point de terminaison de l'API
+            data: Données à envoyer
+            private: Si True, utilise l'authentification privée
+
+        Returns:
+            Réponse de l'API
+
+        Raises:
+            ValueError: Si la méthode HTTP est invalide
+            APIConnectionError: Si la connexion échoue
+            KrakenAPIError: Si l'API retourne une erreur
+        """
+        if not self.session or self.session.closed:
+            self.session = aiohttp.ClientSession(
+                timeout=aiohttp.ClientTimeout(total=self.timeout),
+                connector=aiohttp.TCPConnector(ssl=True, loop=self.loop),
+                headers={
+                    'User-Agent': f'KrakenAPI/1.0 (Python/{os.getenv("PYTHON_VERSION", "3.10")})',
+                    'Accept': 'application/json'
+                }
+            )
+
+        if method not in ['GET', 'POST', 'PUT', 'DELETE']:
+            raise ValueError(f"Méthode HTTP invalide: {method}")
+
+        url = f"{self.base_url}/0/{endpoint}"
+        headers = {}
+
+        if private:
+            nonce = self._get_nonce()
+            data = data or {}
+            data['nonce'] = nonce
+            headers['API-Key'] = self.api_key
+            headers['API-Sign'] = self._sign_message(endpoint, nonce, data)
+
+        # Gestion du rate limiting
+        if self.rate_limit_enabled:
+            current_time = time.time()
+            if current_time - self.last_reset >= self.rate_limit_window:
+                self.requests = defaultdict(int)
+                self.last_reset = current_time
+
+            if self.requests[endpoint] >= self.rate_limit_limit:
+                self.metrics['total_rate_limit_hits'] += 1
+                raise RateLimitError(
+                    f"Limite de taux atteinte pour l'endpoint {endpoint}")
+
+            self.requests[endpoint] += 1
+
+        retries = 0
+        while retries < self.max_retries:
+            try:
+                # S'assurer que data est toujours un dict
+                req_data = data if data is not None else {}
+
+                # Logging de la requête
+                self.logger.debug(
+                    f"Requête vers {url} - Méthode: {method} - Données: {req_data}")
+
+                start_time = time.time()
+                async with self.session.request(method, url, json=req_data, headers=headers) as response:
+                    if response.status != 200:
+                        error_msg = await response.text()
+                        raise APIError(
+                            f"Erreur API: {response.status} - {error_msg}")
+
+                    result = await response.json()
+                    end_time = time.time()
+
+                    # Mise à jour des métriques
+                    self.metrics['total_time'] += (end_time - start_time)
+                    self.metrics['avg_time'] = self.metrics['total_time'] / \
+                        (self.metrics['total_requests'] + 1)
+
+                    # Vérifier que result n'est pas None avant d'appeler .get
+                    if result and not result.get('error'):
+                        # Logging de la réponse
+                        self.logger.debug(f"Réponse de {url}: {result}")
+
+                        # Mise à jour des stats
+                        self.endpoint_stats[endpoint]['requests'] += 1
+                        self.endpoint_stats[endpoint]['success'] += 1
+                        self.endpoint_stats[endpoint]['avg_time'] = (
+                            end_time - start_time)
+                        self.endpoint_stats[endpoint]['last_request_time'] = start_time
+                        self.endpoint_stats[endpoint]['last_response_time'] = end_time
+
+                        return result['result']
+
+                    # Gestion des erreurs de l'API
+                    error = result.get('error', [])
+                    if isinstance(error, list) and len(error) > 0:
+                        error_msg = error[0]
+                        if isinstance(error_msg, str) and error_msg.startswith(
+                            'EAPI:Rate limit exceeded'):
+                            raise RateLimitError(
+                                f"Limite de taux atteinte: {error_msg}")
+                        raise KrakenAPIError(f"Erreur API: {error_msg}")
+
+                    raise KrakenAPIError('Réponse invalide de l\'API')
+            except (ClientError, ClientResponseError) as e:
+                retries += 1
+                self.metrics['total_retries'] += 1
+                self.endpoint_stats[endpoint]['retry_count'] += 1
+
+                if retries >= self.max_retries:
+                    self.endpoint_stats[endpoint]['errors'] += 1
+                    self.endpoint_stats[endpoint]['last_error'] = str(e)
+                    raise APIConnectionError(str(e))
+
+                # Exponential backoff
+                delay = self.retry_delay * (2 ** retries)
+                self.logger.warning(
+                    f"Retry {retries}/{self.max_retries} après {delay}s - {str(e)}")
+                await asyncio.sleep(delay)
+
+    def _get_nonce(self) -> int:
+        """Génère un nonce unique pour les appels privés."""
+        return int(time.time() * 1000000)
+
+    def _sign_message(self, endpoint: str, nonce: int, data: Dict) -> str:
+        """
+        Signe un message pour une requête privée selon la documentation Kraken.
+
+        Args:
+            endpoint: Point de terminaison de l'API
+            nonce: Nonce généré
+            data: Données de la requête
+
+        Returns:
+            Signature encodée en base64
+        """
+        try:
+            # Préparer les données
+            data_str = json.dumps(data or {}, separators=(',', ':'))
+            self.logger.debug(f"Données JSON: {data_str}")
+
+            # Créer le message à signer
+            message = f"/0/private/{endpoint}{nonce}".encode()
+            self.logger.debug(f"Message de base: {message}")
+
+            # Créer le hash des données
+            data_hash = hashlib.sha256(data_str.encode()).digest()
+            self.logger.debug(
+                f"Hash des données: {base64.b64encode(data_hash).decode()}")
+
+            # Concaténer le message et le hash
+            message += data_hash
+            self.logger.debug(
+                f"Message complet: {base64.b64encode(message).decode()}")
+
+            # Créer la signature avec la clé secrète
+            signature = hmac.new(
+                self.api_secret.encode('utf-8'),
+                message,
+                hashlib.sha512
+            ).digest()
+
+            # Encoder en base64
+            final_signature = base64.b64encode(signature).decode('utf-8')
+            self.logger.debug(f"Signature finale: {final_signature}")
+            return final_signature
+
+        except Exception as e:
+            self.logger.error(
+    f"Erreur lors de la création de la signature: {str(e)}",
+     exc_info=True)
+            raise
+
+    async def _ensure_pair_altname_map(self) -> None:
+        """
+        Assure que la map des paires Kraken -> altname est initialisée.
+        """
+        if self.pair_altname_map is None:
+            pairs_info = await self.get_asset_pairs()
+            self.pair_altname_map = {
+    k: v.get(
+        'altname',
+        k) for k,
+         v in pairs_info.items()}
+
+    def _validate_method(self, method: str) -> None:
+        """
+        Valide la méthode HTTP.
+
+        Args:
+            method: Méthode HTTP à valider
+
+        Raises:
+            ValueError: Si la méthode HTTP est invalide
+        """
+        if method not in ['GET', 'POST', 'PUT', 'DELETE']:
+            raise ValueError(f"Méthode HTTP invalide: {method}")
+
+    async def get_recent_spread(
+    self,
+    pair: str,
+     since: Optional[int] = None) -> Dict:
+        """
+        Récupère le spread récent pour une paire.
+
+        Args:
+            pair: Paire de trading
+            since: Timestamp depuis lequel récupérer le spread (optionnel)
+
+        Returns:
+            Dictionnaire avec:
+            - spread: Liste des spreads
+            - last: Timestamp du dernier spread
+            Chaque spread contient:
+            - time: Timestamp
+            - bid: Prix d'achat
+            - ask: Prix de vente
+
+        Raises:
+            ValueError: Si les paramètres sont invalides
+            KrakenAPIError: Si l'API retourne une erreur
+        """
+        try:
+            # Validation des paramètres
+            if not isinstance(pair, str):
+                raise ValueError("La paire doit être une chaîne de caractères")
+            if since is not None and not isinstance(since, int):
+                raise ValueError("Le timestamp doit être un entier")
+
+            # Préparation des données
+            data = {'pair': pair}
+            if since is not None:
+                data['since'] = str(since)
+
+            # Vérification de la paire
+            await self._ensure_pair_altname_map()
+            if pair not in self.pair_altname_map:
+                raise ValueError(f"Paire inconnue: {pair}")
+
+            # Récupération du spread
+            response = await self._request('GET', 'public/Spread', data)
+            self.logger.debug(f"Réponse du spread: {response}")
+
+            # Validation de la réponse
+            if not isinstance(response, dict):
+                raise KrakenAPIError(
+                    "La réponse du spread n'est pas un dictionnaire")
+
+            return response
+
+        except ValueError as e:
+            self.logger.error(
+    f"Erreur de validation des paramètres: {str(e)}",
+     exc_info=True)
+            raise
+
+        except KrakenAPIError as e:
+            self.logger.error(
+    f"Erreur de l'API Kraken: {str(e)}",
+     exc_info=True)
+            raise
+
+        except Exception as e:
+            self.logger.error(
+    f"Erreur lors de la récupération du spread: {str(e)}",
+     exc_info=True)
+            raise KrakenAPIError(
+                f"Erreur lors de la récupération du spread: {str(e)}")
+
+    async def get_assets(
+    self,
+    asset: Optional[str] = None,
+     aclass: Optional[str] = None) -> Dict:
+        """
+        Récupère les informations sur les actifs.
+
+        Args:
+            asset: Actif spécifique à récupérer (optionnel)
+            aclass: Classe d'actif (optionnel)
+
+        Returns:
+            Dictionnaire avec les informations des actifs:
+            - altname: Nom alternatif
+            - aclass: Classe d'actif
+            - decimals: Nombre de décimales
+            - display_decimals: Nombre de décimales à afficher
+
+        Raises:
+            KrakenAPIError: Si l'API retourne une erreur
+        """
+        try:
+            data = {}
+            if asset:
+                data['asset'] = asset
+            if aclass:
+                data['aclass'] = aclass
+
+            response = await self._request('GET', 'public/Assets', data)
+            self.logger.debug(f"Réponse des actifs: {response}")
+
+            # Validation de la réponse
+            if not isinstance(response, dict):
+                raise KrakenAPIError(
+                    "La réponse des actifs n'est pas un dictionnaire")
+
+            return response
+
+        except KrakenAPIError as e:
+            self.logger.error(
+    f"Erreur de l'API Kraken: {str(e)}",
+     exc_info=True)
+            raise
+
+        except Exception as e:
+            self.logger.error(
+    f"Erreur lors de la récupération des actifs: {str(e)}",
+     exc_info=True)
+            raise KrakenAPIError(
+                f"Erreur lors de la récupération des actifs: {str(e)}")
+
+    async def get_ohlc_data(
+    self,
+    pair: str,
+    interval: int = 1,
+     since: Optional[int] = None) -> Dict:
+        """
+        Récupère les données OHLC (Open/High/Low/Close) pour une paire.
+
+        Args:
+            pair: Paire de trading (str)
+            interval: Intervalle en minutes (1, 5, 15, 30, 60, 240, 1440, 10080, 21600)
+            since: Timestamp depuis lequel récupérer les données (optionnel)
+
+        Returns:
+            Dictionnaire avec:
+            - OHLC: Liste des données OHLC
+            - last: Timestamp du dernier OHLC
+
+            Chaque OHLC contient:
+            - time: Timestamp (int)
+            - open: Prix d'ouverture (float)
+            - high: Prix le plus haut (float)
+            - low: Prix le plus bas (float)
+            - close: Prix de clôture (float)
+            - vwap: Prix moyen pondéré (float)
+            - volume: Volume (float)
+            - count: Nombre de trades (int)
+
+        Raises:
+            ValueError: Si les paramètres sont invalides
+            KrakenAPIError: Si l'API retourne une erreur
+        """
+        try:
+            # Validation des paramètres
+            if not isinstance(pair, str):
+                self.logger.error(
+                    f"Type invalide pour pair: {type(pair).__name__}")
+                raise ValueError("pair doit être une chaîne")
+            if not pair:
+                self.logger.error("pair vide")
+                raise ValueError("pair ne peut pas être vide")
+            if pair not in await self.get_tradable_asset_pairs():
+                self.logger.error(f"Paire invalide: {pair}")
+                raise ValueError(f"La paire {pair} n'est pas valide")
+
+            if not isinstance(interval, int):
+                self.logger.error(
+                    f"Type invalide pour interval: {type(interval).__name__}")
+                raise ValueError("interval doit être un entier")
+            valid_intervals = [1, 5, 15, 30, 60, 240, 1440, 10080, 21600]
+            if interval not in valid_intervals:
+                self.logger.error(f"Intervalle invalide: {interval}")
+                raise ValueError(
+                    f"interval doit être l'un des suivants: {', '.join(map(str, valid_intervals))}")
+
+            if since is not None:
+                if not isinstance(since, int):
+                    self.logger.error(
+                        f"Type invalide pour since: {type(since).__name__}")
+                    raise ValueError("since doit être un entier")
+                if since < 0:
+                    self.logger.error(f"Valeur invalide pour since: {since}")
+                    raise ValueError("since ne peut pas être négatif")
+
+            # Préparation des données
+            data = {
+                'pair': pair,
+                'interval': interval
+            }
+            if since is not None:
+                data['since'] = since
+
+            # Récupération des données OHLC
+            response = await self._request('GET', 'public/OHLC', data)
+            self.logger.debug(f"Réponse des données OHLC: {response}")
+
+            # Validation de la réponse
+            if not isinstance(response, dict):
+                self.logger.error(f"Réponse invalide: {response}")
+                raise KrakenAPIError("La réponse n'est pas un dictionnaire")
+
+            # Validation des données OHLC
+            for pair_name, ohlc_data in response.items():
+                if not isinstance(ohlc_data, (list, tuple)):
+                    self.logger.error(
+                        f"Format invalide pour les données OHLC: {ohlc_data}")
+                    raise KrakenAPIError(
+                        f"Les données OHLC pour {pair_name} doivent être une liste")
+
+                # Les données OHLC sont dans la première partie du tuple
+                ohlc = ohlc_data[0]
+                # L'ID du dernier trade est dans la deuxième partie
+                last = ohlc_data[1]
+
+                # Validation des données OHLC individuelles
+                for candle in ohlc:
+                    if not isinstance(candle, list) or len(candle) != 8:
+                        self.logger.error(
+                            f"Format invalide pour une bougie: {candle}")
+                        raise KrakenAPIError(
+                            f"Les bougies OHLC doivent être des listes de 8 éléments")
+
+                    # Validation des types et valeurs
+                    if not isinstance(
+    candle[0], (int, float)) or candle[0] <= 0:  # Timestamp
+                        self.logger.error(f"Timestamp invalide: {candle[0]}")
+                        raise KrakenAPIError(
+                            "Le timestamp doit être un nombre > 0")
+
+                    # Validation des prix (open, high, low, close)
+                    for i in range(1, 5):
+                        if not isinstance(candle[i], (int, float)):
+                            self.logger.error(
+                                f"Type invalide pour le prix {i}: {candle[i]}")
+                            raise KrakenAPIError(
+                                f"Les prix doivent être des nombres")
+                        if candle[i] < 0:
+                            self.logger.error(
+                                f"Prix négatif pour le prix {i}: {candle[i]}")
+                            raise KrakenAPIError(
+                                f"Les prix ne peuvent pas être négatifs")
+
+                    # Validation de high >= low
+                    if candle[2] < candle[3]:  # high < low
+                        self.logger.error(
+                            f"High < low dans la bougie: {candle}")
+                        raise KrakenAPIError(
+                            "Le prix le plus haut ne peut pas être inférieur au prix le plus bas")
+
+                    # Validation de vwap et volume
+                    if not isinstance(
+    candle[5], (int, float)) or candle[5] < 0:  # VWAP
+                        self.logger.error(f"VWAP invalide: {candle[5]}")
+                        raise KrakenAPIError("Le VWAP doit être un nombre ≥ 0")
+
+                    if not isinstance(
+    candle[6], (int, float)) or candle[6] < 0:  # Volume
+                        self.logger.error(f"Volume invalide: {candle[6]}")
+                        raise KrakenAPIError(
+                            "Le volume doit être un nombre ≥ 0")
+
+                    if not isinstance(
+    candle[7], int) or candle[7] < 0:  # Count
+                        self.logger.error(f"Count invalide: {candle[7]}")
+                        raise KrakenAPIError(
+                            "Le count doit être un entier ≥ 0")
+
+                # Validation de last
+                if not isinstance(last, (int, float)) or last <= 0:
+                    self.logger.error(f"Last invalide: {last}")
+                    raise KrakenAPIError(
+                        "L'ID du dernier trade doit être un nombre > 0")
+
+            self.logger.info(
+                f"Données OHLC récupérées avec succès pour {pair}")
+            return response
+
+        except ValueError as e:
+            self.logger.error(
+    f"Erreur de validation des paramètres: {str(e)}",
+     exc_info=True)
+            raise ValueError(f"Erreur de validation des paramètres: {str(e)}")
+        except KrakenAPIError as e:
+            self.logger.error(
+    f"Erreur de l'API Kraken: {str(e)}",
+     exc_info=True)
+            raise KrakenAPIError(f"Erreur de l'API Kraken: {str(e)}")
+        except Exception as e:
+            self.logger.error(
+    f"Erreur lors de la récupération des données OHLC: {str(e)}",
+     exc_info=True)
+            raise KrakenAPIError(
+                f"Erreur lors de la récupération des données OHLC: {str(e)}")
+
+    async def get_server_time(self) -> Dict:
+        """
+        Récupère l'heure du serveur.
+
+        Returns:
+            Dictionnaire avec:
+            - unixtime: Timestamp Unix
+            - rfc1123: Heure au format RFC1123
+
+        Raises:
+            KrakenAPIError: Si l'API retourne une erreur
+        """
+        try:
+            # Récupération de l'heure
+            response = await self._request('GET', 'public/Time', {})
+            self.logger.debug(f"Réponse de l'heure: {response}")
+
+            # Validation de la réponse
+            if not isinstance(response, dict):
+                raise KrakenAPIError(
+                    "La réponse de l'heure n'est pas un dictionnaire")
+
+            required_fields = ['unixtime', 'rfc1123']
+
+            for field in required_fields:
+                if field not in response:
+                    raise KrakenAPIError(f"La réponse manque le champ {field}")
+
+                if field == 'unixtime':
+                    if not isinstance(response[field], int):
+                        raise KrakenAPIError(
+                            "Le champ 'unixtime' doit être un entier")
+                elif field == 'rfc1123':
+                    if not isinstance(response[field], str):
+                        raise KrakenAPIError(
+                            "Le champ 'rfc1123' doit être une chaîne")
+
+            self.logger.info("Heure du serveur récupérée avec succès")
+            return response
+        except KrakenAPIError as e:
+            self.logger.error(
+    f"Erreur de l'API Kraken: {str(e)}",
+     exc_info=True)
+            raise KrakenAPIError(f"Erreur de l'API Kraken: {str(e)}")
+        except Exception as e:
+            self.logger.error(
+    f"Erreur lors de la récupération de l'heure: {str(e)}",
+     exc_info=True)
+            raise KrakenAPIError(
+                f"Erreur lors de la récupération de l'heure: {str(e)}")
+
+    async def get_account_balance(self) -> Dict[str, float]:
+        """
+        Récupère le solde du compte.
+
+        Returns:
+            Dictionnaire avec les montants pour chaque asset
+        """
+        try:
+            response = await self._request('POST', 'private/Balance', private=True)
+            if isinstance(response, dict):
+                return response
+            self.logger.error(f"Réponse invalide de l'API: {response}")
+            return {}
+        except KrakenAPIError as e:
+            self.logger.error(
+                f"Erreur Kraken API lors de la récupération du solde: {str(e)}")
+            raise
+        except Exception as e:
+            self.logger.error(
+    f"Erreur lors de la récupération du solde: {str(e)}",
+     exc_info=True)
+            raise KrakenAPIError(
+                f"Erreur lors de la récupération du solde: {str(e)}")
+
+    async def get_balance(self) -> Dict[str, float]:
+        """Récupère le solde du compte."""
+        return await self.get_account_balance()
+
+    async def get_open_orders(self) -> Dict[str, Any]:
+        """
+        Récupère les ordres ouverts.
+
+        Returns:
+            Dictionnaire avec:
+            - open: Dictionnaire des ordres ouverts
+            - closed: Dictionnaire des ordres fermés
+            - pending: Liste des ordres en attente
+
+        Raises:
+            KrakenAPIError: Si l'API retourne une erreur
+        """
+        try:
+            # Récupération des ordres
+            response = await self._request('POST', 'private/OpenOrders', private=True)
+            self.logger.debug(f"Réponse des ordres ouverts: {response}")
+
+            # Validation générale de la structure de la réponse
+            if not isinstance(response, dict):
+                self.logger.error(f"Format de réponse invalide: {response}")
+                raise KrakenAPIError("La réponse doit être un dictionnaire")
+
+            # Validation des ordres ouverts
+            if 'open' in response:
+                self._validate_open_orders(response['open'])
+
+            # Validation des ordres fermés
+            if 'closed' in response:
+                self._validate_closed_orders(response['closed'])
+
+            # Validation des ordres en attente
+            self._validate_pending_orders(response)
+
+            self.logger.info("Récupération des ordres ouverts réussie")
+            return response
+
+        except ValueError as e:
+            self.logger.error(f"Erreur de validation: {str(e)}")
+            raise ValueError(f"Erreur de validation: {str(e)}")
+        except KrakenAPIError as e:
+            self.logger.error(f"Erreur de l'API Kraken: {str(e)}")
+            raise KrakenAPIError(f"Erreur de l'API Kraken: {str(e)}")
+        except Exception as e:
+            self.logger.error(
+                f"Erreur lors de la récupération des ordres: {str(e)}")
+            raise KrakenAPIError(
+                f"Erreur lors de la récupération des ordres: {str(e)}")
+
+    def _validate_open_orders(self, open_orders: Dict[str, Any]) -> None:
+        """Valide la structure des ordres ouverts."""
+        if not isinstance(open_orders, dict):
+            self.logger.error(
+                f"Les ordres ouverts doivent être un dictionnaire: {open_orders}")
+            raise KrakenAPIError(
+                "Les ordres ouverts doivent être un dictionnaire")
+
+        for txid, order in open_orders.items():
+            self._validate_order(txid, order, is_open=True)
+
+    def _validate_closed_orders(self, closed_orders: Dict[str, Any]) -> None:
+        """Valide la structure des ordres fermés."""
+        if not isinstance(closed_orders, dict):
+            self.logger.error(
+                f"Les ordres fermés doivent être un dictionnaire: {closed_orders}")
+            raise KrakenAPIError(
+                "Les ordres fermés doivent être un dictionnaire")
+
+        for txid, order in closed_orders.items():
+            self._validate_order(txid, order, is_open=False)
+
+    def _validate_order(
+        self, txid: str, order: Dict[str, Any], is_open: bool) -> None:
+        """Valide la structure d'un ordre individuel."""
+        if not isinstance(order, dict):
+            self.logger.error(f"Ordre invalide pour {txid}: {order}")
+            raise KrakenAPIError(f"L'ordre {txid} n'est pas un dictionnaire")
+
+        self._validate_order_description(txid, order)
+        self._validate_order_numeric_fields(txid, order)
+        self._validate_order_timestamps(txid, order, is_open)
+        self._validate_order_flags(txid, order)
+
+    def _validate_order_description(self, txid: str, order: Dict[str, Any]) -> None:
+        """Valide la description d'un ordre."""
+        descr = order.get('descr')
+        if descr is None:
+            self.logger.error(f"Ordre {txid} manque la description")
+            raise KrakenAPIError(f"L'ordre {txid} manque la description")
+
+        if not isinstance(descr, dict):
+            self.logger.error(f"Description invalide pour {txid}: {descr}")
+            raise KrakenAPIError(f"La description de {txid} doit être un dictionnaire")
+
+        required_fields = ['pair', 'type', 'ordertype', 'price', 'price2', 'leverage', 'order', 'close']
+        for field in required_fields:
+            if field not in descr:
+                self.logger.error(f"Description de {txid} manque le champ {field}")
+                raise KrakenAPIError(f"La description de {txid} manque le champ {field}")
+
+        if descr['type'] not in ['buy', 'sell']:
+            self.logger.error(f"Type invalide pour {txid}: {descr['type']}")
+            raise KrakenAPIError(f"Le type de {txid} doit être 'buy' ou 'sell'")
+
+    def _validate_order_numeric_fields(self, txid: str, order: Dict[str, Any]) -> None:
+        """Valide les champs numériques d'un ordre."""
+        numeric_fields = ['vol', 'vol_exec', 'cost', 'fee', 'price', 'stopprice', 'limitprice']
+        for field in numeric_fields:
+            if field not in order:
+                self.logger.error(f"Ordre {txid} manque le champ {field}")
+                raise KrakenAPIError(f"L'ordre {txid} manque le champ {field}")
+
+            value = order[field]
+            if not isinstance(value, (int, float)):
+                self.logger.error(f"{field} invalide dans {txid}: {value}")
+                raise KrakenAPIError(f"{field} doit être un nombre dans {txid}")
+
+            if isinstance(value, float):
+                if math.isnan(value) or math.isinf(value):
+                    self.logger.error(f"{field} contient NaN ou infini dans {txid}")
+                    raise KrakenAPIError(f"{field} ne peut pas contenir NaN ou infini dans {txid}")
+
+            if value < 0:
+                self.logger.error(f"{field} négatif dans {txid}: {value}")
+                raise KrakenAPIError(f"{field} ne peut pas être négatif dans {txid}")
+
+    def _validate_order_timestamps(self, txid: str, order: Dict[str, Any], is_open: bool) -> None:
+        """Valide les timestamps d'un ordre."""
+        if 'opentm' not in order:
+            self.logger.error(f"Ordre {txid} manque le champ 'opentm'")
+            raise KrakenAPIError(f"L'ordre {txid} manque le champ 'opentm'")
+
+        opentm = order['opentm']
+        self._validate_timestamp(txid, 'opentm', opentm)
+
+        if not is_open:
+            if 'closetm' not in order:
+                self.logger.error(f"Ordre fermé {txid} manque le champ 'closetm'")
+                raise KrakenAPIError(f"L'ordre fermé {txid} manque le champ 'closetm'")
+
+            closetm = order['closetm']
+            self._validate_timestamp(txid, 'closetm', closetm)
+            
+            if closetm < opentm:
+                self.logger.error(f"closetm ({closetm}) doit être supérieur à opentm ({opentm}) dans {txid}")
+                raise KrakenAPIError(f"closetm doit être supérieur à opentm dans {txid}")
+
+        if 'starttm' in order:
+            starttm = order['starttm']
+            self._validate_timestamp(txid, 'starttm', starttm)
+
+        if 'expiretm' in order:
+            expiretm = order['expiretm']
+            self._validate_timestamp(txid, 'expiretm', expiretm)
+
+    def _validate_timestamp(self, txid: str, field: str, timestamp: Union[int, float]) -> None:
+        """Valide un timestamp individuel."""
+        if not isinstance(timestamp, (int, float)):
+            self.logger.error(f"{field} invalide dans {txid}: {timestamp}")
+            raise KrakenAPIError(f"{field} doit être un nombre dans {txid}")
+
+        if isinstance(timestamp, float):
+            if math.isnan(timestamp) or math.isinf(timestamp):
+                self.logger.error(f"{field} contient NaN ou infini dans {txid}")
+                raise KrakenAPIError(f"{field} ne peut pas contenir NaN ou infini dans {txid}")
+
+        if timestamp < 0:
+            self.logger.error(f"{field} négatif dans {txid}: {timestamp}")
+            raise KrakenAPIError(f"{field} ne peut pas être négatif dans {txid}")
+
+        if timestamp > time.time() + 3600:  # 1 heure dans le futur maximum
+            self.logger.error(f"{field} dans le futur dans {txid}: {timestamp}")
+            raise KrakenAPIError(f"{field} ne peut pas être dans le futur dans {txid}")
+
+    def _validate_order_flags(self, txid: str, order: Dict[str, Any]) -> None:
+        """Valide les flags et autres champs optionnels d'un ordre."""
+        if 'status' not in order:
+            self.logger.error(f"Ordre {txid} manque le champ 'status'")
+            raise KrakenAPIError(f"L'ordre {txid} manque le champ 'status'")
+
+        if order['status'] not in ['pending', 'open', 'canceled', 'closed', 'expired']:
+            self.logger.error(f"Status invalide pour {txid}: {order['status']}")
+            raise KrakenAPIError(f"Le status de {txid} doit être 'pending', 'open', 'canceled', 'closed' ou 'expired'")
+
+        if 'userref' in order:
+            userref = order['userref']
+            if not isinstance(userref, int):
+                self.logger.error(f"userref invalide dans {txid}: {userref}")
+                raise KrakenAPIError(f"userref doit être un entier dans {txid}")
+
+            if userref < 0:
+                self.logger.error(f"userref négatif dans {txid}: {userref}")
+                raise KrakenAPIError(f"userref ne peut pas être négatif dans {txid}")
+
+        if 'oflags' in order:
+            oflags = order['oflags']
+            if not isinstance(oflags, str):
+                self.logger.error(f"oflags invalide dans {txid}: {oflags}")
+                raise KrakenAPIError(f"oflags doit être une chaîne dans {txid}")
+
+            valid_flags = ['viqc', 'fcib', 'fciq', 'nompp']
+            flags = oflags.split(',')
+            if any(flag not in valid_flags for flag in flags):
+                self.logger.error(f"Drapeau invalide dans {txid}: {oflags}")
+                raise KrakenAPIError(f"Les drapeaux dans {txid} doivent être parmi: {valid_flags}")
+
+        if 'misc' in order:
+            misc = order['misc']
+            if not isinstance(misc, str):
+                self.logger.error(f"misc invalide dans {txid}: {misc}")
+                raise KrakenAPIError(f"misc doit être une chaîne dans {txid}")
+
+    def _validate_pending_orders(self, response: Dict[str, Any]) -> None:
+        """Valide la liste des ordres en attente."""
+        if 'pending' not in response:
+            self.logger.error("La réponse ne contient pas la clé 'pending'")
+            raise KrakenAPIError("La réponse doit contenir la clé 'pending'")
+
+        pending = response['pending']
+        if not isinstance(pending, list):
+            self.logger.error(f"Les pending doivent être une liste: {pending}")
+            raise KrakenAPIError("Les pending doivent être une liste")
+
+        for txid in pending:
+            if not isinstance(txid, str):
+                self.logger.error(f"Les éléments de pending doivent être des chaînes: {txid}")
+                raise KrakenAPIError("Les éléments de pending doivent être des chaînes")
+
+            if not txid.strip():
+                self.logger.error("ID d'ordre en attente vide ou contenant uniquement des espaces")
+                raise KrakenAPIError("Les IDs d'ordres en attente ne peuvent pas être vides ou contenir uniquement des espaces")
+
+            if len(txid) < 10 or len(txid) > 50:
+                self.logger.error(f"Longueur invalide pour ID d'ordre en attente: {len(txid)}")
+                raise KrakenAPIError("Les IDs d'ordres en attente doivent avoir entre 10 et 50 caractères")
+
+    async def get_asset_pairs(self) -> Dict[str, Any]:
+        """
+        Récupère la liste complète des paires de trading.
+        
+        Returns:
+            Dictionnaire avec les informations pour chaque paire:
+            - altname: Nom alternatif de la paire
+            - wsname: Nom pour le websocket
+            - decimals: Nombre de décimales
+            - lot_decimals: Décimales pour le lot
+            - lot_multiplier: Multiplicateur pour le lot
+            - leverage_buy: Levier autorisé pour l'achat
+            - leverage_sell: Levier autorisé pour la vente
+            - fees: Liste des frais
+            - fees_maker: Liste des frais maker
+            - ordermin: Montant minimum pour un ordre
+        """
+        try:
+            res = await self._request('GET', 'public/AssetPairs')
+            if not isinstance(res, dict):
+                return {}
+            return res
+        except Exception as e:
+            self.logger.error(f"Erreur lors de la récupération des paires: {str(e)}")
+            return {}
+
+    async def get_tradable_asset_pairs(self, info: Optional[str] = None, pair: Optional[str] = None) -> Dict:
+        """
+        Récupère les informations sur les paires de trading.
+        
+        Args:
+            info: Type d'information ('info', 'leverage', 'fees', 'margin')
+            pair: Paire de trading (optionnel)
+            
+        Returns:
+            Dictionnaire avec les informations sur les paires de trading
+        """
+        try:
+            # Validation des paramètres
+            params = {}
+            
+            # Validation de info
+            if info is not None:
+                if not isinstance(info, str):
+                    self.logger.error(f"Type invalide pour info: {type(info).__name__}")
+                    raise ValueError("info doit être une chaîne")
+                if not info:
+                    self.logger.error("info vide")
+                    raise ValueError("info ne peut pas être vide")
+                valid_infos = ['info', 'leverage', 'fees', 'margin']
+                if info not in valid_infos:
+                    self.logger.error(f"Type d'information invalide: {info}")
+                    raise ValueError(f"info doit être l'un des suivants: {', '.join(valid_infos)}")
+                params['info'] = info
+
+            # Validation de pair
+            if pair is not None:
+                if not isinstance(pair, str):
+                    self.logger.error(f"Type invalide pour pair: {type(pair).__name__}")
+                    raise ValueError("pair doit être une chaîne")
+                if not pair:
+                    self.logger.error("pair vide")
+                    raise ValueError("pair ne peut pas être vide")
+                params['pair'] = pair
+
+            # Récupération des paires de trading
+            response = await self._request('GET', 'public/AssetPairs', params)
+            
+            # Validation de la réponse
+            if not isinstance(response, dict):
+                self.logger.error(f"Réponse invalide: {response}")
+                raise KrakenAPIError("La réponse n'est pas un dictionnaire")
+
+            # Validation des informations des paires
+            for pair_name, pair_info in response.items():
+                if not isinstance(pair_info, dict):
+                    self.logger.error(f"Format invalide pour la paire: {pair_info}")
+                    raise KrakenAPIError(f"Les informations de la paire {pair_name} doivent être un dictionnaire")
+
+                # Validation des champs requis
+                required_fields = ['wsname', 'base', 'quote', 'lot', 'pair_decimals', 'lot_decimals',
+                                 'lot_multiplier', 'leverage_buy', 'leverage_sell', 'fees', 'fees_maker',
+                                 'margin_call', 'margin_stop']
+                for field in required_fields:
+                    if field not in pair_info:
+                        self.logger.error(f"Champ manquant dans la paire {pair_name}: {field}")
+                        raise KrakenAPIError(f"Le champ {field} est manquant dans la paire {pair_name}")
+
+                # Validation des types
+                string_fields = ['wsname', 'base', 'quote', 'lot']
+                for field in string_fields:
+                    if not isinstance(pair_info[field], str):
+                        self.logger.error(f"Type invalide pour {field}: {type(pair_info[field]).__name__}")
+                        raise KrakenAPIError(f"{field} doit être une chaîne")
+
+                numeric_fields = ['pair_decimals', 'lot_decimals', 'lot_multiplier',
+                                 'margin_call', 'margin_stop']
+                for field in numeric_fields:
+                    if not isinstance(pair_info[field], int):
+                        self.logger.error(f"Type invalide pour {field}: {type(pair_info[field]).__name__}")
+                        raise KrakenAPIError(f"{field} doit être un entier")
+                    if pair_info[field] < 0:
+                        self.logger.error(f"Valeur invalide pour {field}: {pair_info[field]}")
+                        raise KrakenAPIError(f"{field} ne peut pas être négatif")
+
+                # Validation des listes
+                for field in ['leverage_buy', 'leverage_sell', 'fees', 'fees_maker']:
+                    if not isinstance(pair_info[field], list):
+                        self.logger.error(f"Type invalide pour {field}: {type(pair_info[field]).__name__}")
+                        raise KrakenAPIError(f"{field} doit être une liste")
+                    for value in pair_info[field]:
+                        if not isinstance(value, (int, float)):
+                            self.logger.error(f"Type invalide dans {field}: {type(value).__name__}")
+                            raise KrakenAPIError(f"Les valeurs dans {field} doivent être des nombres")
+
+            self.logger.info(f"Paires de trading récupérées avec succès")
+            return response
+            
+        except ValueError as e:
+            self.logger.error(f"Erreur de validation des paramètres: {str(e)}", exc_info=True)
+            raise ValueError(f"Erreur de validation des paramètres: {str(e)}")
+        except KrakenAPIError as e:
+            self.logger.error(f"Erreur de l'API Kraken: {str(e)}", exc_info=True)
+            raise KrakenAPIError(f"Erreur de l'API Kraken: {str(e)}")
+        except Exception as e:
+            self.logger.error(f"Erreur lors de la récupération des paires de trading: {str(e)}", exc_info=True)
+            raise KrakenAPIError(f"Erreur lors de la récupération des paires de trading: {str(e)}")
+
+    async def get_ticker(self, pair: str) -> Dict:
+        """
+        Récupère les informations du ticker.
+        
+        Args:
+            pair: Paire de trading
+            
+        Returns:
+            Dictionnaire avec les informations du ticker
+        
+        Raises:
+            ValueError: Si les paramètres sont invalides
+            KrakenAPIError: Si la réponse de l'API est invalide
+        """
+        try:
+            # Validation des paramètres
+            if not isinstance(pair, str):
+                self.logger.error(f"Type invalide pour pair: {type(pair).__name__}")
+                raise ValueError("La paire doit être une chaîne")
+
+            # Appel à l'API
+            response = await self._request('GET', 'public/Ticker', {'pair': pair})
+
+            # Validation de la réponse
+            if not isinstance(response, dict):
+                self.logger.error(f"Réponse invalide: {response}")
+                raise KrakenAPIError("La réponse doit être un dictionnaire")
+
+            # Validation des données du ticker
+            for pair_name, ticker_data in response.items():
+                if not isinstance(ticker_data, dict):
+                    self.logger.error(f"Format invalide pour le ticker de {pair_name}")
+                    raise KrakenAPIError(f"Le ticker de {pair_name} doit être un dictionnaire")
+
+                # Validation des champs requis
+                required_fields = ['a', 'b', 'c', 'v', 'p', 't', 'l', 'h', 'o']
+                for field in required_fields:
+                    if field not in ticker_data:
+                        self.logger.error(f"Champ {field} manquant pour {pair_name}")
+                        raise KrakenAPIError(f"Le champ {field} est manquant pour {pair_name}")
+
+                # Validation des types et valeurs
+
+                # Validation des volumes
+                if not isinstance(ticker_data['v'], list) or len(ticker_data['v']) != 2:
+                    self.logger.error(f"Format invalide pour v de {pair_name}")
+                    raise KrakenAPIError(f"Le champ v doit être une liste de 2 éléments")
+                
+                volume_today, volume_24h = ticker_data['v']
+                
+                if not isinstance(volume_today, (int, float)) or not isinstance(volume_24h, (int, float)):
+                    self.logger.error(f"Types invalides dans v de {pair_name}")
+                    raise KrakenAPIError(f"Les éléments dans v doivent être des nombres")
+                
+                if volume_today < 0 or volume_24h < 0:
+                    self.logger.error(f"Valeurs invalides dans v de {pair_name}")
+                    raise KrakenAPIError(f"Les valeurs dans v doivent être positives")
+
+                # Validation des prix moyens
+                if not isinstance(ticker_data['p'], list) or len(ticker_data['p']) != 2:
+                    self.logger.error(f"Format invalide pour p de {pair_name}")
+                    raise KrakenAPIError(f"Le champ p doit être une liste de 2 éléments")
+                
+                price_today, price_24h = ticker_data['p']
+                
+                if not isinstance(price_today, (int, float)) or not isinstance(price_24h, (int, float)):
+                    self.logger.error(f"Types invalides dans p de {pair_name}")
+                    raise KrakenAPIError(f"Les éléments dans p doivent être des nombres")
+                
+                if price_today <= 0 or price_24h <= 0:
+                    self.logger.error(f"Valeurs invalides dans p de {pair_name}")
+                    raise KrakenAPIError(f"Les valeurs dans p doivent être strictement positives")
+
+                # Validation des nombres de trades
+                if not isinstance(ticker_data['t'], list) or len(ticker_data['t']) != 2:
+                    self.logger.error(f"Format invalide pour t de {pair_name}")
+                    raise KrakenAPIError(f"Le champ t doit être une liste de 2 éléments")
+                
+                trades_today, trades_24h = ticker_data['t']
+                
+                if not isinstance(trades_today, int) or not isinstance(trades_24h, int):
+                    self.logger.error(f"Types invalides dans t de {pair_name}")
+                    raise KrakenAPIError(f"Les éléments dans t doivent être des entiers")
+                
+                if trades_today < 0 or trades_24h < 0:
+                    self.logger.error(f"Valeurs invalides dans t de {pair_name}")
+                    raise KrakenAPIError(f"Les valeurs dans t doivent être positives")
+
+                # Validation des prix bas
+                if not isinstance(ticker_data['l'], list) or len(ticker_data['l']) != 2:
+                    self.logger.error(f"Format invalide pour l de {pair_name}")
+                    raise KrakenAPIError(f"Le champ l doit être une liste de 2 éléments")
+                
+                low_today, low_24h = ticker_data['l']
+                
+                if not isinstance(low_today, (int, float)) or not isinstance(low_24h, (int, float)):
+                    self.logger.error(f"Types invalides dans l de {pair_name}")
+                    raise KrakenAPIError(f"Les éléments dans l doivent être des nombres")
+                
+                if low_today <= 0 or low_24h <= 0:
+                    self.logger.error(f"Valeurs invalides dans l de {pair_name}")
+                    raise KrakenAPIError(f"Les valeurs dans l doivent être strictement positives")
+
+                # Validation des prix hauts
+                if not isinstance(ticker_data['h'], list) or len(ticker_data['h']) != 2:
+                    self.logger.error(f"Format invalide pour h de {pair_name}")
+                    raise KrakenAPIError(f"Le champ h doit être une liste de 2 éléments")
+                
+                high_today, high_24h = ticker_data['h']
+                
+                if not isinstance(high_today, (int, float)) or not isinstance(high_24h, (int, float)):
+                    self.logger.error(f"Types invalides dans h de {pair_name}")
+                    raise KrakenAPIError(f"Les éléments dans h doivent être des nombres")
+                
+                if high_today <= 0 or high_24h <= 0:
+                    self.logger.error(f"Valeurs invalides dans h de {pair_name}")
+                    raise KrakenAPIError(f"Les valeurs dans h doivent être strictement positives")
+
+                # Validation du prix d'ouverture
+                if not isinstance(ticker_data['o'], (int, float)):
+                    self.logger.error(f"Prix d'ouverture invalide dans o de {pair_name}")
+                    raise KrakenAPIError(f"Le prix d'ouverture dans o doit être un nombre")
+                
+                if ticker_data['o'] <= 0:
+                    self.logger.error(f"Prix d'ouverture négatif ou nul dans o de {pair_name}")
+                    raise KrakenAPIError(f"Le prix d'ouverture dans o doit être strictement positif")
+
+                # Validation de la cohérence des données
+                try:
+                    # Vérification que les prix sont cohérents
+                    if high_today < low_today:
+                        self.logger.error(f"Incohérence des prix pour {pair_name}: high_today ({high_today}) < low_today ({low_today})")
+                        raise KrakenAPIError(f"Les prix pour {pair_name} sont incohérents: high_today doit être supérieur ou égal à low_today")
+                    
+                    if high_24h < low_24h:
+                        self.logger.error(f"Incohérence des prix pour {pair_name}: high_24h ({high_24h}) < low_24h ({low_24h})")
+                        raise KrakenAPIError(f"Les prix pour {pair_name} sont incohérents: high_24h doit être supérieur ou égal à low_24h")
+                    
+                    # Vérification que les volumes sont cohérents
+                    if volume_today > volume_24h:
+                        self.logger.error(f"Incohérence des volumes pour {pair_name}: volume_today ({volume_today}) > volume_24h ({volume_24h})")
+                        raise KrakenAPIError(f"Les volumes pour {pair_name} sont incohérents: volume_today ne peut pas être supérieur à volume_24h")
+                    
+                    if trades_today > trades_24h:
+                        self.logger.error(f"Incohérence des trades pour {pair_name}: trades_today ({trades_today}) > trades_24h ({trades_24h})")
+                        raise KrakenAPIError(f"Les nombres de trades pour {pair_name} sont incohérents: trades_today ne peut pas être supérieur à trades_24h")
+                    
+                    # Vérification que les prix moyens sont cohérents
+                    if price_today > high_today or price_today < low_today:
+                        self.logger.error(f"Incohérence des prix moyens pour {pair_name}: price_today ({price_today}) n'est pas entre high_today ({high_today}) et low_today ({low_today})")
+                        raise KrakenAPIError(f"Les prix moyens pour {pair_name} sont incohérents: price_today doit être entre high_today et low_today")
+                    
+                    if price_24h > high_24h or price_24h < low_24h:
+                        self.logger.error(f"Incohérence des prix moyens pour {pair_name}: price_24h ({price_24h}) n'est pas entre high_24h ({high_24h}) et low_24h ({low_24h})")
+                        raise KrakenAPIError(f"Les prix moyens pour {pair_name} sont incohérents: price_24h doit être entre high_24h et low_24h")
+                except Exception as e:
+                    self.logger.error(f"Erreur lors de la validation de la cohérence des données pour {pair_name}: {str(e)}")
+                    raise KrakenAPIError(f"Erreur lors de la validation de la cohérence des données pour {pair_name}: {str(e)}")
+
+            self.logger.info(f"Ticker récupéré avec succès pour {pair}")
+            return response
+            
+        except ValueError as e:
+            self.logger.error(f"Erreur de validation des paramètres: {str(e)}", exc_info=True)
+            raise ValueError(f"Erreur de validation des paramètres: {str(e)}")
+        except KrakenAPIError as e:
+            self.logger.error(f"Erreur de l'API Kraken: {str(e)}", exc_info=True)
+            raise KrakenAPIError(f"Erreur de l'API Kraken: {str(e)}")
+        except Exception as e:
+            self.logger.error(f"Erreur lors de la récupération du ticker: {str(e)}", exc_info=True)
+            raise KrakenAPIError(f"Erreur lors de la récupération du ticker: {str(e)}")
+
+    async def get_order_book(self, pair: str, count: int = 100) -> Dict:
+        """
+        Récupère le carnet d'ordres.
+        
+        Args:
+            pair: Paire de trading
+            count: Nombre d'ordres à récupérer (1-500)
+            
+        Returns:
+            Dictionnaire avec les ordres d'achat et de vente
+        """
+        try:
+            # Validation de pair
+            if not isinstance(pair, str):
+                self.logger.error(f"Type invalide pour pair: {type(pair).__name__}")
+                raise ValueError("pair doit être une chaîne")
+            if not pair:
+                self.logger.error("pair vide")
+                raise ValueError("pair ne peut pas être vide")
+            if pair not in await self.get_tradable_asset_pairs():
+                self.logger.error(f"Paire invalide: {pair}")
+                raise ValueError(f"La paire {pair} n'est pas valide")
+
+            # Validation de count
+            if not isinstance(count, int):
+                self.logger.error(f"Type invalide pour count: {type(count).__name__}")
+                raise ValueError("count doit être un entier")
+            if count < 1 or count > 500:
+                self.logger.error(f"Valeur invalide pour count: {count}")
+                raise ValueError("count doit être entre 1 et 500")
+
+            # Récupération du carnet d'ordres
+            response = await self._request('GET', 'public/Depth', {'pair': pair, 'count': count})
+            
+            # Validation de la réponse
+            if not isinstance(response, dict):
+                self.logger.error(f"Réponse invalide: {response}")
+                raise KrakenAPIError("La réponse n'est pas un dictionnaire")
+
+            # Validation du carnet d'ordres
+            for pair_name, book in response.items():
+                if not isinstance(book, dict):
+                    self.logger.error(f"Format invalide pour le carnet d'ordres: {book}")
+                    raise KrakenAPIError(f"Le carnet d'ordres pour {pair_name} doit être un dictionnaire")
+
+                # Validation des côtés du carnet
+                required_sides = ['asks', 'bids']
+                for side in required_sides:
+                    if side not in book:
+                        self.logger.error(f"Côté {side} manquant dans le carnet d'ordres")
+                        raise KrakenAPIError(f"Le côté {side} est manquant dans le carnet d'ordres")
+
+                    orders = book[side]
+                    if not isinstance(orders, list):
+                        self.logger.error(f"Format invalide pour les ordres {side}: {orders}")
+                        raise KrakenAPIError(f"Les ordres {side} doivent être une liste")
+
+                    # Validation des ordres individuels
+                    for order in orders:
+                        if not isinstance(order, list):
+                            self.logger.error(f"Format invalide pour un ordre {side}: {order}")
+                            raise KrakenAPIError(f"Les ordres {side} doivent être des listes")
+                        if len(order) != 3:
+                            self.logger.error(f"Format invalide pour un ordre {side}: {order}")
+                            raise KrakenAPIError(f"Les ordres {side} doivent avoir 3 éléments")
+
+                        # Validation des types
+                        if not all(isinstance(x, (int, float)) for x in order):
+                            self.logger.error(f"Types invalides pour un ordre {side}: {order}")
+                            raise KrakenAPIError(f"Les valeurs dans les ordres {side} doivent être des nombres")
+
+                        # Validation des valeurs
+                        if order[0] <= 0:  # Prix
+                            self.logger.error(f"Prix invalide dans un ordre {side}: {order[0]}")
+                            raise KrakenAPIError(f"Le prix dans les ordres {side} doit être > 0")
+                        if order[1] <= 0:  # Volume
+                            self.logger.error(f"Volume invalide dans un ordre {side}: {order[1]}")
+                            raise KrakenAPIError(f"Le volume dans les ordres {side} doit être > 0")
+
+            self.logger.info(f"Carnet d'ordres récupéré avec succès pour {pair}")
+            return response
+            
+        except ValueError as e:
+            self.logger.error(f"Erreur de validation des paramètres: {str(e)}", exc_info=True)
+            raise ValueError(f"Erreur de validation des paramètres: {str(e)}")
+        except KrakenAPIError as e:
+            self.logger.error(f"Erreur de l'API Kraken: {str(e)}", exc_info=True)
+            raise KrakenAPIError(f"Erreur de l'API Kraken: {str(e)}")
+        except Exception as e:
+            self.logger.error(f"Erreur lors de la récupération du carnet d'ordres: {str(e)}", exc_info=True)
+            raise KrakenAPIError(f"Erreur lors de la récupération du carnet d'ordres: {str(e)}")
+            raise KrakenAPIError(f"Erreur lors de la récupération du carnet d'ordres: {str(e)}")
+
+    async def create_order(self, params: OrderParams) -> Dict[str, Any]:
+        """
+        Crée un ordre sur Kraken.
+        
+        Args:
+            params: Paramètres de l'ordre (voir OrderParams)
+            
+        Returns:
+            Dictionnaire avec:
+            - descr: Description de l'ordre
+            - txid: ID de la transaction
+            - ordertxid: ID de l'ordre
+            - trades: Liste des trades exécutés
+            - status: Statut de l'ordre
+            - reason: Raison de l'échec (si applicable)
+        """
+        try:
+            # Validation des paramètres
+            if not isinstance(params, dict):
+                self.logger.error(f"Type invalide pour params: {type(params).__name__}")
+                raise ValueError("Les paramètres doivent être un dictionnaire")
+
+            # Validation des paramètres obligatoires
+            required_fields = ['pair', 'type', 'ordertype', 'volume']
+            for field in required_fields:
+                if field not in params:
+                    self.logger.error(f"Champ manquant: {field}")
+                    raise ValueError(f"Le champ {field} est requis")
+
+            # Validation du type d'ordre
+            valid_types = ['buy', 'sell']
+            if params['type'] not in valid_types:
+                self.logger.error(f"Type d'ordre invalide: {params['type']}")
+                raise ValueError(f"Le type d'ordre doit être l'un des suivants: {', '.join(valid_types)}")
+
+            # Validation du type d'ordre
+            valid_ordertypes = ['market', 'limit', 'stop-loss', 'take-profit', 'stop-loss-limit', 'take-profit-limit']
+            if params['ordertype'] not in valid_ordertypes:
+                self.logger.error(f"Type d'ordre invalide: {params['ordertype']}")
+                raise ValueError(f"Le type d'ordre doit être l'un des suivants: {', '.join(valid_ordertypes)}")
+
+            # Validation du volume
+            if not isinstance(params['volume'], (int, float)):
+                self.logger.error(f"Type invalide pour volume: {type(params['volume']).__name__}")
+                raise ValueError("Le volume doit être un nombre")
+            if params['volume'] <= 0:
+                self.logger.error(f"Volume invalide: {params['volume']}")
+                raise ValueError("Le volume doit être positif")
+
+            # Validation des paramètres optionnels
+            if 'price' in params:
+                if not isinstance(params['price'], (int, float)):
+                    self.logger.error(f"Type invalide pour price: {type(params['price']).__name__}")
+                    raise ValueError("Le prix doit être un nombre")
+                if params['price'] <= 0:
+                    self.logger.error(f"Prix invalide: {params['price']}")
+                    raise ValueError("Le prix doit être positif")
+
+            if 'price2' in params:
+                if not isinstance(params['price2'], (int, float)):
+                    self.logger.error(f"Type invalide pour price2: {type(params['price2']).__name__}")
+                    raise ValueError("Le prix 2 doit être un nombre")
+                if params['price2'] <= 0:
+                    self.logger.error(f"Prix 2 invalide: {params['price2']}")
+                    raise ValueError("Le prix 2 doit être positif")
+
+            if 'leverage' in params:
+                if not isinstance(params['leverage'], str):
+                    self.logger.error(f"Type invalide pour leverage: {type(params['leverage']).__name__}")
+                    raise ValueError("Le levier doit être une chaîne")
+
+            if 'oflags' in params:
+                if not isinstance(params['oflags'], list):
+                    self.logger.error(f"Type invalide pour oflags: {type(params['oflags']).__name__}")
+                    raise ValueError("Les drapeaux doivent être une liste")
+                for flag in params['oflags']:
+                    if not isinstance(flag, str):
+                        self.logger.error(f"Type invalide pour drapeau: {type(flag).__name__}")
+                        raise ValueError("Les drapeaux doivent être des chaînes")
+
+            if 'starttm' in params:
+                if not isinstance(params['starttm'], str):
+                    self.logger.error(f"Type invalide pour starttm: {type(params['starttm']).__name__}")
+                    raise ValueError("starttm doit être une chaîne")
+
+            if 'expiretm' in params:
+                if not isinstance(params['expiretm'], str):
+                    self.logger.error(f"Type invalide pour expiretm: {type(params['expiretm']).__name__}")
+
+            if 'validate' in params:
+                if not isinstance(params['validate'], bool):
+                    self.logger.error(f"Type invalide pour validate: {type(params['validate']).__name__}")
+                    raise ValueError("validate doit être un booléen")
+
+            if 'close' in params:
+                if not isinstance(params['close'], dict):
+                    self.logger.error(f"Type invalide pour close: {type(params['close']).__name__}")
+                    raise ValueError("close doit être un dictionnaire")
+
+            # Création de l'ordre
+            res = await self._request('POST', 'private/AddOrder', params, private=True)
+            
+            # Validation de la réponse
+            if not isinstance(res, dict):
+                self.logger.error(f"Réponse invalide: {res}")
+                raise KrakenAPIError("La réponse de l'API n'est pas un dictionnaire")
+
+            # Validation des champs de réponse
+            required_fields = ['descr', 'txid', 'ordertxid', 'status']
+            for field in required_fields:
+                if field not in res:
+                    self.logger.error(f"Champ manquant dans la réponse: {field}")
+                    raise KrakenAPIError(f"Le champ {field} est manquant dans la réponse")
+
+            # Validation des types de base
+            if not isinstance(res['txid'], str):
+                self.logger.error(f"Type invalide pour txid: {type(res['txid']).__name__}")
+                raise KrakenAPIError("txid doit être une chaîne")
+
+            if not isinstance(res['ordertxid'], str):
+                self.logger.error(f"Type invalide pour ordertxid: {type(res['ordertxid']).__name__}")
+                raise KrakenAPIError("ordertxid doit être une chaîne")
+
+            if not isinstance(res['status'], str):
+                self.logger.error(f"Type invalide pour status: {type(res['status']).__name__}")
+                raise KrakenAPIError("status doit être une chaîne")
+
+            # Validation optionnelle des champs
+            if 'reason' in res and not isinstance(res['reason'], str):
+                self.logger.error(f"Type invalide pour reason: {type(res['reason']).__name__}")
+                raise KrakenAPIError("reason doit être une chaîne")
+
+            if 'trades' in res and not isinstance(res['trades'], list):
+                self.logger.error(f"Type invalide pour trades: {type(res['trades']).__name__}")
+                raise KrakenAPIError("trades doit être une liste")
+
+            # Validation de la description
+            descr = res['descr']
+            if not isinstance(descr, dict):
+                self.logger.error(f"Type invalide pour descr: {type(descr).__name__}")
+                raise KrakenAPIError("descr doit être un dictionnaire")
+
+            # Validation des champs de la description
+            descr_fields = ['pair', 'type', 'ordertype', 'price', 'price2', 'leverage', 'order', 'close']
+            for field in descr_fields:
+                if field not in descr:
+                    self.logger.error(f"Champ manquant dans la description: {field}")
+                    raise KrakenAPIError(f"Le champ {field} est manquant dans la description")
+
+            # Validation des types dans la description
+            if not isinstance(descr['pair'], str):
+                self.logger.error(f"Type invalide pour pair: {type(descr['pair']).__name__}")
+                raise KrakenAPIError("pair doit être une chaîne")
+
+            if descr['type'] not in ['buy', 'sell']:
+                self.logger.error(f"Type d'ordre invalide: {descr['type']}")
+                raise KrakenAPIError("Le type d'ordre doit être 'buy' ou 'sell'")
+
+            if descr['ordertype'] not in ['market', 'limit', 'stop-loss', 'take-profit', 'stop-loss-limit', 'take-profit-limit', 'settle-position']:
+                self.logger.error(f"Type d'ordre invalide: {descr['ordertype']}")
+                raise KrakenAPIError("Le type d'ordre n'est pas supporté")
+
+            # Validation des valeurs numériques
+            for field in ['price', 'price2', 'leverage']:
+                if field in descr and not isinstance(descr[field], (int, float)):
+                    self.logger.error(f"Type invalide pour {field}: {type(descr[field]).__name__}")
+                    raise KrakenAPIError(f"{field} doit être un nombre")
+
+            # Validation des chaînes dans la description
+            for field in ['order', 'close']:
+                if field in descr and not isinstance(descr[field], str):
+                    self.logger.error(f"Type invalide pour {field}: {type(descr[field]).__name__}")
+                    raise KrakenAPIError(f"{field} doit être une chaîne")
+
+            self.logger.info(f"Ordre créé avec succès: {res['txid']}")
+            return res
+            
+        except ValueError as e:
+            self.logger.error(f"Erreur de validation des paramètres: {str(e)}", exc_info=True)
+            raise ValueError(f"Erreur de validation des paramètres: {str(e)}")
+        except KrakenAPIError as e:
+            self.logger.error(f"Erreur de l'API Kraken: {str(e)}", exc_info=True)
+            raise KrakenAPIError(f"Erreur de l'API Kraken: {str(e)}")
+        except Exception as e:
+            self.logger.error(f"Erreur lors de la création de l'ordre: {str(e)}", exc_info=True)
+            raise KrakenAPIError(f"Erreur lors de la création de l'ordre: {str(e)}")
+
+    async def cancel_order(self, txid: str) -> Dict:
+        """
+        Annule un ordre.
+        
+        Args:
+            txid: ID de l'ordre à annuler
+            
+        Returns:
+            Dictionnaire avec:
+            - count: Nombre d'ordres annulés
+            - pending: Liste des IDs d'ordres en attente
+            
+        Raises:
+            ValueError: Si le txid est invalide
+            KrakenAPIError: Si l'API retourne une erreur
+        """
+        try:
+            # Validation du txid
+            if not isinstance(txid, str):
+                self.logger.error(f"Type invalide pour txid: {type(txid).__name__}")
+                raise ValueError("Le txid doit être une chaîne")
+            if not txid.strip():
+                self.logger.error("txid vide ou contenant uniquement des espaces")
+                raise ValueError("Le txid ne peut pas être vide ou contenir uniquement des espaces")
+            if len(txid) < 10 or len(txid) > 50:
+                self.logger.error(f"Longueur invalide pour txid: {len(txid)}")
+                raise ValueError("Le txid doit avoir entre 10 et 50 caractères")
+
+            # Appel à l'API
+            response = await self._request('POST', 'private/CancelOrder', {'txid': txid}, private=True)
+
+            # Validation de la réponse
+            if not isinstance(response, dict):
+                self.logger.error(f"Format de réponse invalide: {response}")
+                raise KrakenAPIError("La réponse doit être un dictionnaire")
+
+            # Validation des champs
+            required_fields = ['count', 'pending']
+            for field in required_fields:
+                if field not in response:
+                    self.logger.error(f"Champ {field} manquant dans la réponse")
+                    raise KrakenAPIError(f"Le champ {field} est manquant dans la réponse")
+
+            # Validation de count
+            if not isinstance(response['count'], int):
+                self.logger.error(f"count invalide: {response['count']}")
+                raise KrakenAPIError("count doit être un entier")
+            if response['count'] < 0:
+                self.logger.error(f"count négatif: {response['count']}")
+                raise KrakenAPIError("count ne peut pas être négatif")
+
+            # Validation de pending
+            if not isinstance(response['pending'], list):
+                self.logger.error(f"pending invalide: {response['pending']}")
+                raise KrakenAPIError("pending doit être une liste")
+            for pending_id in response['pending']:
+                if not isinstance(pending_id, str):
+                    self.logger.error(f"ID en attente invalide: {pending_id}")
+                    raise KrakenAPIError("Les IDs en attente doivent être des chaînes")
+                if not pending_id.strip():
+                    self.logger.error("ID en attente vide")
+                    raise KrakenAPIError("Les IDs en attente ne peuvent pas être vides")
+                if len(pending_id) < 10 or len(pending_id) > 50:
+                    self.logger.error(f"Longueur invalide pour ID en attente: {len(pending_id)}")
+                    raise KrakenAPIError("Les IDs en attente doivent avoir entre 10 et 50 caractères")
+
+            self.logger.info(f"Ordre {txid} annulé avec succès")
+            return response
+            
+        except ValueError as e:
+            self.logger.error(f"Erreur de validation: {str(e)}")
+            raise ValueError(f"Erreur de validation: {str(e)}")
+        except KrakenAPIError as e:
+            self.logger.error(f"Erreur de l'API Kraken: {str(e)}")
+            raise KrakenAPIError(f"Erreur de l'API Kraken: {str(e)}")
+        except Exception as e:
+            self.logger.error(f"Erreur lors de l'annulation de l'ordre: {str(e)}")
+            raise KrakenAPIError(f"Erreur lors de l'annulation de l'ordre: {str(e)}")
+        finally:
+            self.logger.info(f"Fin de l'annulation de l'ordre {txid}")
+
+    async def get_recent_trades(self, pair: str, since: Optional[int] = None) -> Dict:
+        """
+        Récupère les trades récents pour une paire.
+        
+        Args:
+            pair: Paire de trading (str)
+            since: Timestamp depuis lequel récupérer les trades (optionnel)
+            
+        Returns:
+            Dictionnaire avec:
+            - trades: Liste des trades
+            - last: Timestamp du dernier trade
+            
+            Chaque trade contient:
+            - price: Prix
+            - volume: Volume
+            - time: Timestamp
+            - side: Côté (buy/sell)
+            - type: Type de trade (market/limit)
+            - misc: Informations supplémentaires
+            
+        Raises:
+            ValueError: Si les paramètres sont invalides
+            KrakenAPIError: Si l'API retourne une erreur
+        """
+        try:
+            # Validation des paramètres
+            if not isinstance(pair, str):
+                self.logger.error(f"Type invalide pour pair: {type(pair).__name__}")
+                raise ValueError("La paire doit être une chaîne")
+            if not pair.strip():
+                self.logger.error("pair vide ou contenant uniquement des espaces")
+                raise ValueError("La paire ne peut pas être vide ou contenir uniquement des espaces")
+            if len(pair) > 20:
+                self.logger.error(f"Longueur invalide pour pair: {len(pair)}")
+                raise ValueError("La paire ne doit pas dépasser 20 caractères")
+
+            if since is not None:
+                if not isinstance(since, (int, float)):
+                    self.logger.error(f"Type invalide pour since: {type(since).__name__}")
+                    raise ValueError("since doit être un nombre")
+                if since < 0:
+                    self.logger.error(f"since négatif: {since}")
+                    raise ValueError("since ne peut pas être négatif")
+
+            # Préparation des paramètres
+            params = {'pair': pair}
+            if since is not None:
+                params['since'] = since
+
+            # Appel à l'API
+            response = await self._request('POST', 'public/Trades', params)
+
+            # Validation de la réponse
+            if not isinstance(response, dict):
+                self.logger.error(f"Format de réponse invalide: {response}")
+                raise KrakenAPIError("La réponse doit être un dictionnaire")
+
+            # Validation des trades
+            trades = response.get('result', {}).get(pair, [])
+            if not isinstance(trades, list):
+                self.logger.error(f"Format invalide pour les trades: {trades}")
+                raise KrakenAPIError("Les trades doivent être une liste")
+
+            # Validation de chaque trade
+            for trade in trades:
+                if not isinstance(trade, list) or len(trade) != 6:
+                    self.logger.error(f"Format invalide pour un trade: {trade}")
+                    raise KrakenAPIError("Chaque trade doit être une liste de 6 éléments")
+
+                price, volume, time, side, type_, misc = trade
+
+                # Validation des types
+                if not isinstance(price, (int, float)):
+                    self.logger.error(f"Prix invalide: {price}")
+                    raise KrakenAPIError("Le prix doit être un nombre")
+                if isinstance(price, float):
+                    if math.isnan(price) or math.isinf(price):
+                        self.logger.error(f"Prix contient NaN ou infini: {price}")
+                        raise KrakenAPIError("Le prix ne peut pas contenir NaN ou infini")
+                if price <= 0:
+                    self.logger.error(f"Prix négatif ou nul: {price}")
+                    raise KrakenAPIError("Le prix ne peut pas être négatif ou nul")
+
+                if not isinstance(volume, (int, float)):
+                    self.logger.error(f"Volume invalide: {volume}")
+                    raise KrakenAPIError("Le volume doit être un nombre")
+                if isinstance(volume, float):
+                    if math.isnan(volume) or math.isinf(volume):
+                        self.logger.error(f"Volume contient NaN ou infini: {volume}")
+                        raise KrakenAPIError("Le volume ne peut pas contenir NaN ou infini")
+                if volume <= 0:
+                    self.logger.error(f"Volume négatif ou nul: {volume}")
+                    raise KrakenAPIError("Le volume ne peut pas être négatif ou nul")
+
+                if not isinstance(time, (int, float)):
+                    self.logger.error(f"Timestamp invalide: {time}")
+                    raise KrakenAPIError("Le timestamp doit être un nombre")
+                if isinstance(time, float):
+                    if math.isnan(time) or math.isinf(time):
+                        self.logger.error(f"Timestamp contient NaN ou infini: {time}")
+                        raise KrakenAPIError("Le timestamp ne peut pas contenir NaN ou infini")
+                if time < 0:
+                    self.logger.error(f"Timestamp négatif: {time}")
+                    raise KrakenAPIError("Le timestamp ne peut pas être négatif")
+
+                if not isinstance(side, str):
+                    self.logger.error(f"Côté invalide: {side}")
+                    raise KrakenAPIError("Le côté doit être une chaîne")
+                if side not in ['b', 's']:
+                    self.logger.error(f"Côté invalide: {side}")
+                    raise KrakenAPIError("Le côté doit être 'b' (buy) ou 's' (sell)")
+
+                if not isinstance(type_, str):
+                    self.logger.error(f"Type invalide: {type_}")
+                    raise KrakenAPIError("Le type doit être une chaîne")
+                if type_ not in ['m', 'l']:
+                    self.logger.error(f"Type invalide: {type_}")
+                    raise KrakenAPIError("Le type doit être 'm' (market) ou 'l' (limit)")
+
+                if not isinstance(misc, str):
+                    self.logger.error(f"Informations supplémentaires invalides: {misc}")
+                    raise KrakenAPIError("Les informations supplémentaires doivent être une chaîne")
+
+            # Validation du last
+            last = response.get('result', {}).get('last')
+            if last is not None:
+                if not isinstance(last, (int, float)):
+                    self.logger.error(f"last invalide: {last}")
+                    raise KrakenAPIError("last doit être un nombre")
+                if isinstance(last, float):
+                    if math.isnan(last) or math.isinf(last):
+                        self.logger.error(f"last contient NaN ou infini: {last}")
+                        raise KrakenAPIError("last ne peut pas contenir NaN ou infini")
+                if last < 0:
+                    self.logger.error(f"last négatif: {last}")
+                    raise KrakenAPIError("last ne peut pas être négatif")
+
+            return response
+
+        except ValueError as e:
+            self.logger.error(f"Erreur de validation: {str(e)}")
+            raise ValueError(f"Erreur de validation: {str(e)}")
+        except KrakenAPIError as e:
+            self.logger.error(f"Erreur de l'API Kraken: {str(e)}")
+            raise KrakenAPIError(f"Erreur de l'API Kraken: {str(e)}")
+        except Exception as e:
+            self.logger.error(f"Erreur lors de la récupération des trades: {str(e)}")
+            raise KrakenAPIError(f"Erreur lors de la récupération des trades: {str(e)}")
+
+    async def query_orders_info(self, txid: Union[str, List[str]], trades: bool = False, userref: Optional[int] = None) -> Dict:
+        """
+        Récupère des informations sur des ordres spécifiques.
+        
+        Args:
+            txid: ID de transaction ou liste d'IDs
+            trades: Si True, inclut les trades associés
+            userref: Référence utilisateur
+            
+        Returns:
+            Dictionnaire avec les informations sur les ordres
+        """
+        try:
+            # Validation des paramètres
+            params = {}
+            
+            # Validation de txid
+            if not txid:
+                self.logger.error("txid est requis")
+                raise ValueError("txid est requis")
+            
+            if isinstance(txid, str):
+                if not txid:
+                    self.logger.error("txid vide")
+                    raise ValueError("txid ne peut pas être vide")
+                params['txid'] = txid
+            elif isinstance(txid, list):
+                if not all(isinstance(t, str) for t in txid):
+                    self.logger.error(f"Tous les éléments de txid doivent être des chaînes: {txid}")
+                    raise ValueError("Tous les éléments de txid doivent être des chaînes")
+                if not txid:
+                    self.logger.error("Liste txid vide")
+                    raise ValueError("txid ne peut pas être une liste vide")
+                params['txid'] = ','.join(txid)
+            else:
+                self.logger.error(f"Type invalide pour txid: {type(txid).__name__}")
+                raise ValueError("txid doit être une chaîne ou une liste de chaînes")
+
+            # Validation de trades
+            params['trades'] = 'true' if trades else 'false'
+
+            # Validation de userref
+            if userref is not None:
+                if not isinstance(userref, int):
+                    self.logger.error(f"Type invalide pour userref: {type(userref).__name__}")
+                    raise ValueError("userref doit être un entier")
+                if userref < 0:
+                    self.logger.error(f"Valeur invalide pour userref: {userref}")
+                    raise ValueError("userref ne peut pas être négatif")
+                params['userref'] = userref
+
+            # Récupération des informations
+            response = await self._request('POST', 'private/QueryOrders', params, private=True)
+            
+            # Validation de la réponse
+            if not isinstance(response, dict):
+                self.logger.error(f"Réponse invalide: {response}")
+                raise KrakenAPIError("La réponse n'est pas un dictionnaire")
+
+            # Validation des ordres
+            for order_id, order in response.get('orders', {}).items():
+                if not isinstance(order, dict):
+                    self.logger.error(f"Ordre invalide pour {order_id}: {order}")
+                    raise KrakenAPIError(f"L'ordre {order_id} n'est pas un dictionnaire")
+
+                # Validation des champs requis
+                required_fields = ['refid', 'userref', 'status', 'opentm', 'closetm', 'starttm', 'expiretm', 'descr', 'vol', 'vol_exec', 'cost', 'fee', 'price', 'stopprice', 'limitprice']
+                for field in required_fields:
+                    if field not in order:
+                        self.logger.error(f"Champ manquant dans l'ordre {order_id}: {field}")
+                        raise KrakenAPIError(f"L'ordre {order_id} manque le champ {field}")
+
+                # Validation des types
+                if not isinstance(order['refid'], str):
+                    self.logger.error(f"Type invalide pour refid dans {order_id}: {type(order['refid']).__name__}")
+                    raise KrakenAPIError("refid doit être une chaîne")
+
+                if not isinstance(order['status'], str):
+                    self.logger.error(f"Type invalide pour status dans {order_id}: {type(order['status']).__name__}")
+                    raise KrakenAPIError("status doit être une chaîne")
+
+                numeric_fields = ['vol', 'vol_exec', 'cost', 'fee', 'price', 'stopprice', 'limitprice']
+                for field in numeric_fields:
+                    if not isinstance(order[field], (int, float)):
+                        self.logger.error(f"Type invalide pour {field} dans {order_id}: {type(order[field]).__name__}")
+                        raise KrakenAPIError(f"{field} doit être un nombre")
+
+            self.logger.info(f"Informations des ordres récupérées avec succès: {txid}")
+            return response
+            
+        except ValueError as e:
+            self.logger.error(f"Erreur de validation des paramètres: {str(e)}", exc_info=True)
+            raise ValueError(f"Erreur de validation des paramètres: {str(e)}")
+        except KrakenAPIError as e:
+            self.logger.error(f"Erreur de l'API Kraken: {str(e)}", exc_info=True)
+            raise KrakenAPIError(f"Erreur de l'API Kraken: {str(e)}")
+        finally:
+            self.logger.info(f"Fin de la requête des informations des ordres")
+
+        try:
+            # Logique de récupération des informations des ordres
+            pass  # À implémenter
+        except Exception as e:
+            self.logger.error(f"Erreur lors de la récupération des informations des ordres: {str(e)}", exc_info=True)
+            raise KrakenAPIError(f"Erreur lors de la récupération des informations des ordres: {str(e)}")
+
+    async def get_trade_balance(self, aclass: Optional[str] = None, asset: Optional[str] = None) -> Dict:
+        """
+        Récupère le solde de trading.
+        
+        Args:
+            aclass: Classe d'actif (optionnel)
+            asset: Actif (optionnel)
+            
+        Returns:
+            Dictionnaire avec le solde de trading
+        """
+        try:
+            # Validation des paramètres
+            params = {}
+            
+            if aclass is not None:
+                if not isinstance(aclass, str):
+                    self.logger.error(f"Type invalide pour aclass: {type(aclass).__name__}")
+                    raise ValueError("aclass doit être une chaîne")
+                if not aclass:
+                    self.logger.error("aclass vide")
+                    raise ValueError("aclass ne peut pas être vide")
+                params['aclass'] = aclass
+
+            if asset is not None:
+                if not isinstance(asset, str):
+                    self.logger.error(f"Type invalide pour asset: {type(asset).__name__}")
+                    raise ValueError("asset doit être une chaîne")
+                if not asset:
+                    self.logger.error("asset vide")
+                    raise ValueError("asset ne peut pas être vide")
+                params['asset'] = asset
+
+            # Récupération du solde
+            response = await self._request('POST', 'private/TradeBalance', params, private=True)
+            
+            # Validation de la réponse
+            if not isinstance(response, dict):
+                self.logger.error(f"Réponse invalide: {response}")
+                raise KrakenAPIError("La réponse n'est pas un dictionnaire")
+
+            # Validation des champs de réponse
+            required_fields = ['eb', 'tb', 'm', 'n', 'c', 'v', 'e', 'mf']
+            for field in required_fields:
+                if field not in response:
+                    self.logger.error(f"Champ manquant: {field}")
+                    raise KrakenAPIError(f"Le champ {field} est manquant")
+
+            # Validation des types numériques
+            numeric_fields = ['eb', 'tb', 'm', 'n', 'c', 'v', 'e', 'mf']
+            for field in numeric_fields:
+                value = response[field]
+                if not isinstance(value, (int, float)):
+                    self.logger.error(f"Type invalide pour {field}: {type(value).__name__}, valeur: {value}")
+                    raise KrakenAPIError(f"{field} doit être un nombre")
+                if isinstance(value, float):
+                    if math.isnan(value) or math.isinf(value):
+                        self.logger.error(f"Valeur invalide pour {field}: {value}")
+                        raise KrakenAPIError(f"{field} contient une valeur invalide (NaN ou infini)")
+
+            self.logger.info("Solde de trading récupéré avec succès")
+            return response
+            
+        except ValueError as e:
+            self.logger.error(f"Erreur de validation des paramètres: {str(e)}", exc_info=True)
+            raise ValueError(f"Erreur de validation des paramètres: {str(e)}")
+        except KrakenAPIError as e:
+            self.logger.error(f"Erreur de l'API Kraken: {str(e)}", exc_info=True)
+            raise KrakenAPIError(f"Erreur de l'API Kraken: {str(e)}")
+        except Exception as e:
+            self.logger.error(f"Erreur lors de la récupération du solde de trading: {str(e)}", exc_info=True)
+            raise KrakenAPIError(f"Erreur lors de la récupération du solde de trading: {str(e)}")
+        finally:
+            self.logger.info(f"Fin de la récupération du solde de trading")
+
+    async def get_ledgers_info(self, id: Union[str, List[str]], aclass: Optional[str] = None, asset: Optional[str] = None) -> Dict:
+        """
+        Récupère les informations sur les livres de compte.
+        
+        Args:
+            id: ID du livre ou liste d'IDs
+            aclass: Classe d'actif (optionnel)
+            asset: Actif (optionnel)
+            
+        Returns:
+            Dictionnaire avec les informations sur les livres
+        """
+        try:
+            # Validation des paramètres
+            params = {}
+            
+            # Validation de id
+            if not id:
+                self.logger.error("id est requis")
+                raise ValueError("id est requis")
+            
+            if isinstance(id, str):
+                if not id:
+                    self.logger.error("id vide")
+                    raise ValueError("id ne peut pas être vide")
+                params['id'] = id
+            elif isinstance(id, list):
+                if not all(isinstance(i, str) for i in id):
+                    self.logger.error(f"Tous les éléments de id doivent être des chaînes: {id}")
+                    raise ValueError("Tous les éléments de id doivent être des chaînes")
+                if not id:
+                    self.logger.error("Liste id vide")
+                    raise ValueError("id ne peut pas être une liste vide")
+                params['id'] = ','.join(id)
+            else:
+                self.logger.error(f"Type invalide pour id: {type(id).__name__}")
+                raise ValueError("id doit être une chaîne ou une liste de chaînes")
+
+            # Validation de aclass
+            if aclass is not None:
+                if not isinstance(aclass, str):
+                    self.logger.error(f"Type invalide pour aclass: {type(aclass).__name__}")
+                    raise ValueError("aclass doit être une chaîne")
+                if not aclass:
+                    self.logger.error("aclass vide")
+                    raise ValueError("aclass ne peut pas être vide")
+                params['aclass'] = aclass
+
+            # Validation de asset
+            if asset is not None:
+                if not isinstance(asset, str):
+                    self.logger.error(f"Type invalide pour asset: {type(asset).__name__}")
+                    raise ValueError("asset doit être une chaîne")
+                if not asset:
+                    self.logger.error("asset vide")
+                    raise ValueError("asset ne peut pas être vide")
+                params['asset'] = asset
+
+            # Récupération des informations
+            response = await self._request('POST', 'private/Ledgers', params, private=True)
+            
+            # Validation de la réponse
+            if not isinstance(response, dict):
+                self.logger.error(f"Réponse invalide: {response}")
+                raise KrakenAPIError("La réponse n'est pas un dictionnaire")
+
+            # Validation des livres
+            for ledger_id, ledger in response.get('ledger', {}).items():
+                if not isinstance(ledger, dict):
+                    self.logger.error(f"Livre invalide pour {ledger_id}: {ledger}")
+                    raise KrakenAPIError(f"Le livre {ledger_id} n'est pas un dictionnaire")
+
+                # Validation des champs requis
+                required_fields = ['refid', 'time', 'type', 'aclass', 'asset', 'amount', 'fee', 'balance']
+                for field in required_fields:
+                    if field not in ledger:
+                        self.logger.error(f"Champ manquant dans le livre {ledger_id}: {field}")
+                        raise KrakenAPIError(f"Le livre {ledger_id} manque le champ {field}")
+
+                # Validation des types
+                if not isinstance(ledger['refid'], str):
+                    self.logger.error(f"Type invalide pour refid dans {ledger_id}: {type(ledger['refid']).__name__}")
+                    raise KrakenAPIError("refid doit être une chaîne")
+                
+                # Validation des types numériques
+                numeric_fields = ['amount', 'fee', 'balance']
+                for field in numeric_fields:
+                    if not isinstance(ledger[field], (int, float)):
+                        self.logger.error(f"Type invalide pour {field} dans {ledger_id}: {type(ledger[field]).__name__}")
+
+            self.logger.info(f"Informations des livres récupérées avec succès: {id}")
+            return response
+            
+        except ValueError as e:
+            self.logger.error(f"Erreur de validation des paramètres: {str(e)}", exc_info=True)
+            raise ValueError(f"Erreur de validation des paramètres: {str(e)}")
+        except KrakenAPIError as e:
+            self.logger.error(f"Erreur de l'API Kraken: {str(e)}", exc_info=True)
+            raise KrakenAPIError(f"Erreur de l'API Kraken: {str(e)}")
+        except Exception as e:
+            self.logger.error(f"Erreur lors de la récupération des informations des livres: {str(e)}", exc_info=True)
+            raise KrakenAPIError(f"Erreur lors de la récupération des informations des livres: {str(e)}")
+        finally:
+            self.logger.info(f"Fin de la récupération des informations des livres")
+
+    async def query_orders_info(self, txid: Union[str, List[str]]) -> Dict:
+        """
+        Récupère les informations sur les ordres.
+        
+        Args:
+            txid: ID de l'ordre ou liste d'IDs
+        
+        Returns:
+            Dictionnaire avec les informations sur les ordres
+        """
+        try:
+            # Validation des paramètres
+            params = {}
+            
+            # Validation de txid
+            if not txid:
+                self.logger.error("txid est requis")
+                raise ValueError("txid est requis")
+            
+            if isinstance(txid, str):
+                if not txid:
+                    self.logger.error("txid vide")
+                    raise ValueError("txid ne peut pas être vide")
+                params['txid'] = txid
+            elif isinstance(txid, list):
+                if not all(isinstance(i, str) for i in txid):
+                    self.logger.error(f"Tous les éléments de txid doivent être des chaînes: {txid}")
+                    raise ValueError("Tous les éléments de txid doivent être des chaînes")
+                if not txid:
+                    self.logger.error("Liste txid vide")
+                    raise ValueError("txid ne peut pas être une liste vide")
+                params['txid'] = ','.join(txid)
+            else:
+                self.logger.error(f"Type invalide pour txid: {type(txid).__name__}")
+                raise ValueError("txid doit être une chaîne ou une liste de chaînes")
+
+            # Récupération des informations
+            response = await self._request('POST', 'private/QueryOrders', params, private=True)
+            
+            # Validation de la réponse
+            if not isinstance(response, dict):
+                self.logger.error(f"Réponse invalide: {response}")
+                raise KrakenAPIError("La réponse n'est pas un dictionnaire")
+
+            # Validation des ordres
+            for order_id, order in response.get('orders', {}).items():
+                if not isinstance(order, dict):
+                    self.logger.error(f"Ordre invalide pour {order_id}: {order}")
+                    raise KrakenAPIError(f"L'ordre {order_id} n'est pas un dictionnaire")
+
+                # Validation des champs requis
+                required_fields = ['refid', 'userref', 'status', 'opentm', 'starttm', 'expiretm', 'descr', 'vol', 'vol_exec', 'cost', 'fee', 'price', 'stopprice', 'limitprice']
+                for field in required_fields:
+                    if field not in order:
+                        self.logger.error(f"Champ manquant dans l'ordre {order_id}: {field}")
+                        raise KrakenAPIError(f"L'ordre {order_id} manque le champ {field}")
+
+                # Validation des types
+                if not isinstance(order['refid'], str):
+                    self.logger.error(f"Type invalide pour refid dans {order_id}: {type(order['refid']).__name__}")
+                    raise KrakenAPIError("refid doit être une chaîne")
+
+                # Validation des types numériques
+                numeric_fields = ['vol', 'vol_exec']
+                for field in numeric_fields:
+                    if not isinstance(order[field], (int, float)):
+                        self.logger.error(f"Type invalide pour {field} dans {order_id}: {type(order[field]).__name__}")
+                        raise KrakenAPIError(f"{field} doit être un nombre")
+
+                if not isinstance(order['status'], str):
+                    self.logger.error(f"Type invalide pour status dans {order_id}: {type(order['status']).__name__}")
+                    raise KrakenAPIError("status doit être une chaîne")
+
+                valid_statuses = ['pending', 'open', 'closed', 'canceled', 'expired']
+                if order['status'] not in valid_statuses:
+                    self.logger.error(f"Statut invalide dans {order_id}: {order['status']}")
+                    raise KrakenAPIError(f"Le statut doit être l'un des suivants: {', '.join(valid_statuses)}")
+
+            self.logger.info(f"Informations des ordres récupérées avec succès")
+            return response
+            
+        except ValueError as e:
+            self.logger.error(f"Erreur de validation des paramètres: {str(e)}", exc_info=True)
+            raise ValueError(f"Erreur de validation des paramètres: {str(e)}")
+        except KrakenAPIError as e:
+            self.logger.error(f"Erreur de l'API Kraken: {str(e)}", exc_info=True)
+            raise KrakenAPIError(f"Erreur de l'API Kraken: {str(e)}")
+        except Exception as e:
+            self.logger.error(f"Erreur lors de la récupération des informations des ordres: {str(e)}", exc_info=True)
+            raise KrakenAPIError(f"Erreur lors de la récupération des informations des ordres: {str(e)}")
+        finally:
+            self.logger.info(f"Fin de la récupération des informations des ordres")
+
+    async def start_websocket(self) -> None:
+        """
+        Démarre la connexion WebSocket.
+        """
+        try:
+            if self.ws_client and self.ws_client.running:
+                self.logger.warning("La connexion WebSocket est déjà active")
+                return
+            
+            # Récupération du token WebSocket
+            token = await self.get_websocket_token()
+            
+            # Initialisation et démarrage du client WebSocket
+            self.ws_client = KrakenWebSocketClient(token)
+            await self.ws_client.start()
+            
+            self.logger.info("Connexion WebSocket établie avec succès")
+        except Exception as e:
+            self.logger.error(f"Erreur lors du démarrage du WebSocket: {str(e)}", exc_info=True)
+            raise KrakenAPIError(f"Erreur lors du démarrage du WebSocket: {str(e)}")
+        finally:
+            self.logger.info("Fin de l'initialisation du WebSocket")
+
+    async def stop_websocket(self) -> None:
+        """
+        Arrête la connexion WebSocket.
+        """
+        try:
+            self.ws_running = False
+            if self.ws_connection:
+                await self.ws_connection.close()
+            if self.ws_session:
+                await self.ws_session.close()
+            self.ws_connection = None
+            self.ws_session = None
+            self.ws_subscriptions.clear()
+            self.ws_token = None
+            self.ws_token_expiration = 0
+        except Exception as e:
+            self.logger.error(f"Erreur lors de l'arrêt du WebSocket: {str(e)}")
+            raise KrakenAPIError(f"Erreur lors de l'arrêt du WebSocket: {str(e)}")
+        finally:
+            self.logger.info("WebSocket arrêté avec succès")
+
+    async def subscribe(self, pair: str, feed: str) -> None:
+        """
+        S'abonne à un feed WebSocket pour une paire.
+        
+        Args:
+            pair: Paire de trading
+            feed: Type de feed (ticker, trades, spread, etc.)
+        """
+        try:
+            # Vérification de la paire
+            await self._ensure_pair_altname_map()
+            if pair not in self.pair_altname_map:
+                raise ValueError(f"Paire inconnue: {pair}")
+            
+            # Vérification du feed
+            if feed not in ['ticker', 'trades', 'spread', 'book', 'ohlc']:
+                raise ValueError(f"Feed non supporté: {feed}")
+            
+            # Ajout de la souscription
+            self.ws_subscriptions[pair].add(feed)
+            
+            # Préparation du message de souscription
+            subscription = {
+                'name': feed,
+                'pair': [pair]
+            }
+            message = {
+                'event': 'subscribe',
+                'subscription': subscription
+            }
+            
+            # Vérification de la connexion WebSocket
+            if not self.ws_client or not self.ws_client.running:
+                raise KrakenAPIError("La connexion WebSocket n'est pas active")
+            await self.ws_message_queue.put(message)
+            self.logger.debug(f"Message d'abonnement envoyé: {message}")
+        except ValueError as e:
+            self.logger.error(f"Erreur de validation lors de l'abonnement: {str(e)}", exc_info=True)
+            raise ValueError(f"Erreur de validation lors de l'abonnement: {str(e)}")
+        except Exception as e:
+            self.logger.error(f"Erreur lors de l'abonnement au feed: {str(e)}", exc_info=True)
+            raise KrakenAPIError(f"Erreur lors de l'abonnement au feed: {str(e)}")
+
+    async def unsubscribe(self, pair: str, feed: str) -> None:
+        """
+        Se désabonne d'un feed WebSocket pour une paire.
+        
+        Args:
+            pair: Paire de trading
+            feed: Type de feed (ticker, trades, spread, book, ohlc, ownTrades, openOrders)
+        
+        Raises:
+            ValueError: Si la paire ou le feed est invalide
+            KrakenAPIError: Si le désabonnement échoue
+        """
+        try:
+            # Vérification de la paire
+            await self._ensure_pair_altname_map()
+            if pair not in self.pair_altname_map:
+                raise ValueError(f"Paire inconnue: {pair}")
+            
+            # Vérification du feed
+            valid_feeds = ['ticker', 'trades', 'spread', 'book', 'ohlc', 'ownTrades', 'openOrders']
+            if feed not in valid_feeds:
+                raise ValueError(f"Feed invalide: {feed}. Doit être l'un de: {', '.join(valid_feeds)}")
+            
+            # Suppression du feed des abonnements
+            if pair in self.ws_subscriptions:
+                self.ws_subscriptions[pair].discard(feed)
+                self.logger.info(f"Désabonné avec succès de {feed} pour {pair}")
+                if not self.ws_subscriptions[pair]:
+                    del self.ws_subscriptions[pair]
+            
+            # Préparation du message
+            message = {
+                'event': 'unsubscribe',
+                'pair': [pair],
+                'subscription': {'name': feed}
+            }
+            await self.ws_message_queue.put(message)
+            self.logger.debug(f"Message de désabonnement envoyé: {message}")
+        except ValueError as e:
+            self.logger.error(f"Erreur de validation lors du désabonnement: {str(e)}", exc_info=True)
+            raise ValueError(f"Erreur de validation lors du désabonnement: {str(e)}")
+        except Exception as e:
+            self.logger.error(f"Erreur lors du désabonnement du feed: {str(e)}", exc_info=True)
+            raise KrakenAPIError(f"Erreur lors du désabonnement du feed: {str(e)}")
+
+    async def _websocket_handler(self) -> None:
+        """
+        Gestionnaire principal WebSocket.
+        
+        Traite les messages dans la file d'attente et les envoie via la connexion WebSocket.
+        """
+        try:
+            while self.ws_running:
+                # Vérification et rétablissement de la connexion si nécessaire
+                if not self.ws_connection:
+                    await self._connect_websocket()
+                    continue
+                
+                # Récupération et envoi du message
+                message = await self.ws_message_queue.get()
+                if self.ws_connection:
+                    await self.ws_connection.send_json(message)
+        except Exception as e:
+            self.logger.error(f"Erreur dans le gestionnaire WebSocket: {str(e)}", exc_info=True)
+            await self._handle_websocket_error()
+            await asyncio.sleep(1)
+
+    async def _process_websocket_message(self, message: Any) -> None:
+        """
+        Traite les messages reçus via WebSocket.
+        
+        Args:
+            message: Message reçu via WebSocket
+        """
+        try:
+            if not isinstance(message, dict):
+                self.logger.error(f"Message WebSocket invalide: {message}")
+                return
+            
+            event = message.get('event')
+            
+            if event == 'subscriptionStatus':
+                if message.get('status') == 'subscribed':
+                    self.logger.info(f"Souscription réussie: {message}")
+                elif message.get('status') == 'unsubscribed':
+                    self.logger.info(f"Désabonnement réussi: {message}")
+                else:
+                    self.logger.error(f"État de souscription inconnu: {message}")
+            elif event == 'ping':
+                self.logger.debug("Ping reçu")
+            elif event == 'pong':
+                self.logger.debug("Pong reçu")
+            elif event == 'error':
+                self.logger.error(f"Erreur WebSocket: {message}")
+                await self._handle_websocket_error()
+            else:
+                # Traitement des données de marché
+                pair = message.get('pair')
+                feed = message.get('subscription', {}).get('name')
+                
+                if pair and feed:
+                    self.logger.debug(f"Données reçues pour {pair} - {feed}: {message}")
+                    # TODO: Implémenter le traitement des données selon le type de feed
+                else:
+                    self.logger.error(f"Message WebSocket invalide: {message}")
+        except Exception as e:
+            self.logger.error(f"Erreur lors du traitement du message WebSocket: {str(e)}", exc_info=True)
+            await self._handle_websocket_error()
+
+    async def _websocket_ping(self) -> None:
+        """
+        Gestionnaire de ping WebSocket.
+        
+        Envoie un ping périodique pour maintenir la connexion active.
+        """
+        try:
+            while self.ws_running:
+                # Vérification de la connexion et envoi du ping
+                if self.ws_connection:
+                    await self.ws_connection.send_json({'event': 'ping'})
+                    self.logger.debug("Ping WebSocket envoyé")
+                
+                # Attente avant le prochain ping
+                await asyncio.sleep(self.ws_ping_interval)
+        except Exception as e:
+            self.logger.error(f"Erreur lors du ping WebSocket: {str(e)}", exc_info=True)
+            await self._handle_websocket_error()
+            await asyncio.sleep(1)
+        finally:
+            self.logger.info("Fin du gestionnaire de ping WebSocket")
+
+    async def _connect_websocket(self) -> None:
+        """
+        Établit la connexion WebSocket et souscrit aux flux.
+        
+        Cette méthode gère la connexion WebSocket et s'assure que tous les abonnements
+        préalablement configurés sont rétablis après une nouvelle connexion.
+        """
+        try:
+            if not self.ws_connection:
+                # Établissement de la connexion WebSocket
+                self.ws_connection = await self.session.ws_connect(self.ws_url)
+                
+                # Démarrage de la tâche de ping
+                self.ws_ping_task = asyncio.create_task(self._websocket_ping())
+                self.logger.info("Connexion WebSocket établie avec succès")
+                
+                # Rétablissement des abonnements
+                for pair, feeds in self.ws_subscriptions.items():
+                    for feed in feeds:
+                        await self.subscribe(pair, feed)
+            else:
+                self.logger.info("Connexion WebSocket déjà établie")
+        except Exception as e:
+            self.logger.error(f"Erreur lors de la connexion WebSocket: {str(e)}", exc_info=True)
+            await self._handle_websocket_error()
+        finally:
+            self.logger.info("Fin de la tentative de connexion WebSocket")
+            raise KrakenAPIError(f"Erreur lors de la connexion WebSocket: {str(e)}")
+
+    async def _handle_websocket_error(self) -> None:
+        """
+        Gestionnaire d'erreurs WebSocket.
+        
+        Nettoie les ressources WebSocket en cas d'erreur.
+        """
+        try:
+            # Fermeture de la connexion WebSocket
+            if self.ws_connection:
+                await self.ws_connection.close()
+                self.ws_connection = None
+                self.logger.info("Connexion WebSocket fermée")
+            
+            # Annulation de la tâche de ping
+            if self.ws_ping_task:
+                self.ws_ping_task.cancel()
+                self.ws_ping_task = None
+                self.logger.info("Tâche de ping annulée")
+            
+            # Réinitialisation des abonnements
+            self.ws_subscriptions.clear()
+            self.logger.info("Abonnements réinitialisés")
+        except Exception as e:
+            self.logger.error(f"Erreur lors de la gestion de l'erreur WebSocket: {str(e)}", exc_info=True)
+        finally:
+            self.logger.info("Fin du gestionnaire d'erreurs WebSocket")
+
+    async def cancel_order(self, txid: str) -> Dict[str, Any]:
+        """
+        Annule un ordre.
+        
+        Args:
+            txid: ID de l'ordre à annuler
+            
+        Returns:
+            Dictionnaire avec:
+            - count: Nombre d'ordres annulés
+            - pending: Liste des IDs d'ordres en attente
+            - open: Dictionnaire des ordres ouverts restants
+            - closed: Dictionnaire des ordres fermés
+            
+        Raises:
+            ValueError: Si le txid est invalide
+            KrakenAPIError: Si l'API retourne une erreur
+        """
+        try:
+            # Validation du txid
+            if not isinstance(txid, str):
+                self.logger.error(f"txid doit être une chaîne: {txid}")
+                raise ValueError("txid doit être une chaîne")
+            
+            if not txid.strip():
+                self.logger.error("txid ne peut pas être vide ou contenir uniquement des espaces")
+                raise ValueError("txid ne peut pas être vide ou contenir uniquement des espaces")
+            
+            if len(txid) < 10 or len(txid) > 50:
+                self.logger.error(f"txid doit avoir entre 10 et 50 caractères: {len(txid)}")
+                raise ValueError("txid doit avoir entre 10 et 50 caractères")
+            
+            # Appel à l'API
+            params = {'txid': txid}
+            response = await self._request('POST', 'private/CancelOrder', params, private=True)
+            self.logger.debug(f"Réponse de l'annulation d'ordre: {response}")
+            
+            # Validation générale de la réponse
+            if not isinstance(response, dict):
+                self.logger.error(f"Format de réponse invalide: {response}")
+                raise KrakenAPIError("La réponse doit être un dictionnaire")
+            
+            # Validation du champ count
+            count = response.get('count')
+            if count is None:
+                self.logger.error("La réponse manque le champ 'count'")
+                raise KrakenAPIError("La réponse doit contenir le champ 'count'")
+            
+            if not isinstance(count, int):
+                self.logger.error(f"count doit être un entier: {count}")
+                raise KrakenAPIError("count doit être un entier")
+            
+            if count < 0:
+                self.logger.error(f"count ne peut pas être négatif: {count}")
+                raise KrakenAPIError("count ne peut pas être négatif")
+            
+            # Validation du champ pending
+            pending = response.get('pending')
+            if pending is None:
+                self.logger.error("La réponse manque le champ 'pending'")
+                raise KrakenAPIError("La réponse doit contenir le champ 'pending'")
+            
+            if not isinstance(pending, list):
+                self.logger.error(f"pending doit être une liste: {pending}")
+                raise KrakenAPIError("pending doit être une liste")
+            
+            # Validation des éléments de pending
+            self._validate_pending_orders(response)
+            
+            # Validation des ordres ouverts restants
+            if 'open' in response:
+                self._validate_open_orders(response['open'])
+            
+            # Validation des ordres fermés
+            if 'closed' in response:
+                self._validate_closed_orders(response['closed'])
+            
+            self.logger.info(f"Annulation de l'ordre {txid} réussie")
+            return response
+            
+        except ValueError as e:
+            self.logger.error(f"Erreur de validation: {str(e)}")
+            raise ValueError(f"Erreur de validation: {str(e)}")
+        except KrakenAPIError as e:
+            self.logger.error(f"Erreur de l'API Kraken: {str(e)}")
+            raise KrakenAPIError(f"Erreur de l'API Kraken: {str(e)}")
+        except Exception as e:
+            self.logger.error(f"Erreur lors de l'annulation de l'ordre: {str(e)}")
+            raise KrakenAPIError(f"Erreur lors de l'annulation de l'ordre: {str(e)}")
+
+    async def get_open_orders(self) -> Dict:
+        """
+        Récupère les ordres ouverts sur Kraken.
+        
+        Returns:
+            Dictionnaire avec:
+            - open: Dictionnaire des ordres ouverts
+            - closed: Dictionnaire des ordres fermés
+            - pending: Liste des ordres en attente
+
+            Chaque ordre contient:
+            - refid: str - ID de référence
+            - userref: int - Référence utilisateur
+            - status: str - Statut ('open', 'closed', 'canceled', 'expired')
+            - opentm: float - Timestamp d'ouverture
+            - starttm: float - Timestamp de début
+            - expiretm: float - Timestamp d'expiration
+            - descr: dict - Description
+            - vol: float - Volume
+            - vol_exec: float - Volume exécuté
+            - cost: float - Coût
+            - fee: float - Frais
+            - price: float - Prix moyen
+            - stopprice: float - Prix de déclenchement
+            - limitprice: float - Prix limite
+            - misc: str - Informations supplémentaires
+            - oflags: str - Drapeaux d'ordre
+
+            La description contient:
+            - pair: str - Paire de trading
+            - type: str - Type ('buy', 'sell')
+            - ordertype: str - Type d'ordre
+            - price: float - Prix
+            - price2: float - Prix 2 (pour les ordres stop-loss/limit)
+            - leverage: str - Levier
+            - order: str - Description de l'ordre
+            - close: str - Description de la condition de fermeture
+
+        Raises:
+            KrakenAPIError: Si l'API retourne une erreur
+        """
+        try:
+            # Récupération des ordres
+            response = await self._request('POST', 'private/OpenOrders', {}, private=True)
+            self.logger.debug(f"Réponse des ordres ouverts: {response}")
+
+            # Validation de la réponse
+            if not isinstance(response, dict):
+                self.logger.error(f"Format de réponse invalide: {response}")
+                raise KrakenAPIError("La réponse doit être un dictionnaire")
+
+            # Validation des champs requis
+            required_fields = ['open', 'closed', 'pending']
+            for field in required_fields:
+                if field not in response:
+                    self.logger.error(f"Champ {field} manquant dans la réponse")
+                    raise KrakenAPIError(f"Le champ {field} est manquant dans la réponse")
+
+            # Validation des types
+            if not isinstance(response['open'], dict):
+                self.logger.error("Le champ open doit être un dictionnaire")
+                raise KrakenAPIError("Le champ open doit être un dictionnaire")
+            if not isinstance(response['closed'], dict):
+                self.logger.error("Le champ closed doit être un dictionnaire")
+                raise KrakenAPIError("Le champ closed doit être un dictionnaire")
+            if not isinstance(response['pending'], list):
+                self.logger.error("Le champ pending doit être une liste")
+                raise KrakenAPIError("Le champ pending doit être une liste")
+
+            # Validation détaillée des ordres ouverts
+            for order_id, order_data in response['open'].items():
+                if not isinstance(order_data, dict):
+                    self.logger.error(f"Format invalide pour l'ordre {order_id}")
+                    raise KrakenAPIError(f"Les données de l'ordre {order_id} doivent être un dictionnaire")
+
+                # Validation des champs de l'ordre
+                order_fields = ['refid', 'userref', 'status', 'opentm', 'starttm', 'expiretm', 'descr', 'vol', 'vol_exec', 'cost', 'fee', 'price', 'stopprice', 'limitprice', 'misc', 'oflags']
+                for field in order_fields:
+                    if field not in order_data:
+                        self.logger.error(f"Champ {field} manquant pour l'ordre {order_id}")
+                        raise KrakenAPIError(f"Le champ {field} est manquant pour l'ordre {order_id}")
+
+                # Validation des types et valeurs
+                if not isinstance(order_data['refid'], str):
+                    self.logger.error(f"refid invalide pour l'ordre {order_id}")
+                    raise KrakenAPIError("refid doit être une chaîne")
+
+                if not isinstance(order_data['userref'], int):
+                    self.logger.error(f"userref invalide pour l'ordre {order_id}")
+                    raise KrakenAPIError("userref doit être un entier")
+
+                if order_data['status'] not in ['pending', 'open', 'canceled', 'closed', 'expired']:
+                    self.logger.error(f"status invalide pour l'ordre {order_id}")
+                    raise KrakenAPIError("status doit être 'pending', 'open', 'canceled', 'closed' ou 'expired'")
+
+                # Validation des timestamps
+                for timestamp_field in ['opentm', 'starttm', 'expiretm']:
+                    if not isinstance(order_data[timestamp_field], (int, float)):
+                        self.logger.error(f"{timestamp_field} invalide pour l'ordre {order_id}")
+                        raise KrakenAPIError(f"{timestamp_field} doit être un nombre")
+                    if order_data[timestamp_field] < 0:
+                        self.logger.error(f"{timestamp_field} négatif pour l'ordre {order_id}")
+                        raise KrakenAPIError(f"{timestamp_field} ne peut pas être négatif")
+
+                # Validation de la description
+                if not isinstance(order_data['descr'], dict):
+                    self.logger.error(f"Description invalide pour l'ordre {order_id}")
+                    raise KrakenAPIError("La description doit être un dictionnaire")
+
+                descr_fields = ['pair', 'type', 'ordertype', 'price', 'price2', 'leverage', 'order', 'close']
+                for field in descr_fields:
+                    if field not in order_data['descr']:
+                        self.logger.error(f"Champ {field} manquant dans la description de l'ordre {order_id}")
+                        raise KrakenAPIError(f"Le champ {field} est manquant dans la description")
+
+                # Validation des valeurs numériques
+                numeric_fields = ['vol', 'vol_exec', 'cost', 'fee', 'price', 'stopprice', 'limitprice']
+                for field in numeric_fields:
+                    if not isinstance(order_data[field], (int, float)):
+                        self.logger.error(f"{field} invalide pour l'ordre {order_id}")
+                        raise KrakenAPIError(f"{field} doit être un nombre")
+                    if isinstance(order_data[field], float):
+                        if math.isnan(order_data[field]) or math.isinf(order_data[field]):
+                            self.logger.error(f"{field} contient NaN ou infini pour l'ordre {order_id}")
+                            raise KrakenAPIError(f"{field} ne peut pas contenir NaN ou infini")
+                    if order_data[field] < 0:
+                        self.logger.error(f"{field} négatif pour l'ordre {order_id}")
+                        raise KrakenAPIError(f"{field} ne peut pas être négatif")
+
+                # Validation des flags
+                if not isinstance(order_data['oflags'], str):
+                    self.logger.error(f"oflags invalide pour l'ordre {order_id}")
+                    raise KrakenAPIError("oflags doit être une chaîne")
+
+                # Validation de la cohérence
+                if order_data['vol_exec'] > order_data['vol']:
+                    self.logger.error(f"vol_exec ({order_data['vol_exec']}) > vol ({order_data['vol']}) pour l'ordre {order_id}")
+                    raise KrakenAPIError("vol_exec ne peut pas être supérieur à vol")
+
+                if order_data['cost'] < 0:
+                    self.logger.error(f"cost négatif pour l'ordre {order_id}")
+                    raise KrakenAPIError("cost ne peut pas être négatif")
+
+                if order_data['fee'] < 0:
+                    self.logger.error(f"fee négatif pour l'ordre {order_id}")
+                    raise KrakenAPIError("fee ne peut pas être négatif")
+
+            # Validation des ordres ouverts
+            for txid, order in response['open'].items():
+                if not isinstance(order, dict):
+                    self.logger.error(f"Ordre invalide pour {txid}: {order}")
+                    raise KrakenAPIError(f"L'ordre {txid} n'est pas un dictionnaire")
+
+                # Validation des champs de base
+                required_order_fields = [
+                    'refid', 'userref', 'status', 'opentm', 'starttm', 'expiretm',
+                    'descr', 'vol', 'vol_exec', 'cost', 'fee', 'price', 'stopprice',
+                    'limitprice', 'misc', 'oflags'
+                ]
+
+                for field in required_order_fields:
+                    if field not in order:
+                        self.logger.error(f"L'ordre {txid} manque le champ {field}")
+                        raise KrakenAPIError(f"L'ordre {txid} manque le champ {field}")
+
+                # Validation des types
+                if not isinstance(order['refid'], (str, type(None))):
+                    self.logger.error(f"Le refid de {txid} n'est pas une chaîne ou None")
+                    raise KrakenAPIError(f"Le refid de {txid} doit être une chaîne ou None")
+
+                if not isinstance(order['userref'], int):
+                    self.logger.error(f"Le userref de {txid} n'est pas un entier")
+                    raise KrakenAPIError(f"Le userref de {txid} doit être un entier")
+
+                if order['status'] not in ['open', 'closed', 'canceled', 'expired']:
+                    self.logger.error(f"Le statut de {txid} est invalide")
+                    raise KrakenAPIError(f"Le statut de {txid} est invalide")
+
+                # Validation des timestamps
+                for field in ['opentm', 'starttm', 'expiretm']:
+                    if not isinstance(order[field], (int, float)):
+                        self.logger.error(f"Le champ {field} de {txid} n'est pas un nombre")
+                        raise KrakenAPIError(f"Le champ {field} de {txid} doit être un nombre")
+
+                # Validation des valeurs numériques
+                for field in ['vol', 'vol_exec', 'cost', 'fee', 'price', 'stopprice', 'limitprice']:
+                    if not isinstance(order[field], (int, float)):
+                        self.logger.error(f"Le champ {field} de {txid} n'est pas un nombre")
+                        raise KrakenAPIError(f"Le champ {field} de {txid} doit être un nombre")
+
+                # Validation des chaînes
+                for field in ['misc', 'oflags']:
+                    if not isinstance(order[field], str):
+                        self.logger.error(f"Le champ {field} de {txid} n'est pas une chaîne")
+                        raise KrakenAPIError(f"Le champ {field} de {txid} doit être une chaîne")
+
+                # Validation de la description
+                if not isinstance(order['descr'], dict):
+                    self.logger.error(f"La description de {txid} n'est pas un dictionnaire")
+                    raise KrakenAPIError(f"La description de {txid} doit être un dictionnaire")
+
+                # Validation des champs de la description
+                required_descr_fields = [
+                    'pair', 'type', 'ordertype', 'price', 'price2', 'leverage',
+                    'order', 'close'
+                ]
+
+                for field in required_descr_fields:
+                    if field not in order['descr']:
+                        self.logger.error(f"La description de {txid} manque le champ {field}")
+                        raise KrakenAPIError(f"La description de {txid} manque le champ {field}")
+
+                # Validation du type
+                if order['descr']['type'] not in ['buy', 'sell']:
+                    self.logger.error(f"Le type de {txid} est invalide")
+                    raise KrakenAPIError(f"Le type de {txid} est invalide")
+
+                # Validation des valeurs numériques dans la description
+                if not isinstance(order['descr']['price'], (int, float)):
+                    self.logger.error(f"Le prix de {txid} dans la description doit être un nombre")
+                    raise KrakenAPIError(f"Le prix de {txid} dans la description doit être un nombre")
+
+                if not isinstance(order['descr']['price2'], (int, float)):
+                    self.logger.error(f"Le prix secondaire de {txid} doit être un nombre")
+                    raise KrakenAPIError(f"Le prix secondaire de {txid} doit être un nombre")
+
+                if not isinstance(order['descr']['leverage'], (int, float)):
+                    self.logger.error(f"Le levier de {txid} doit être un nombre")
+                    raise KrakenAPIError(f"Le levier de {txid} doit être un nombre")
+
+                # Validation des chaînes dans la description
+                if not isinstance(order['descr']['order'], str):
+                    self.logger.error(f"La description complète de {txid} doit être une chaîne")
+                    raise KrakenAPIError(f"La description complète de {txid} doit être une chaîne")
+
+                if not isinstance(order['descr']['close'], str):
+                    self.logger.error(f"La condition de fermeture de {txid} doit être une chaîne")
+                    raise KrakenAPIError(f"La condition de fermeture de {txid} doit être une chaîne")
+
+                self.logger.info(f"Ordre {txid} validé avec succès")
+
+            # Validation des ordres fermés
+            for txid, order in response['closed'].items():
+                if not isinstance(order, dict):
+                    self.logger.error(f"Ordre invalide pour {txid}: {order}")
+                    raise KrakenAPIError(f"L'ordre {txid} n'est pas un dictionnaire")
+
+                # Validation des champs de base
+                required_order_fields = [
+                    'refid', 'userref', 'status', 'opentm', 'starttm', 'expiretm',
+                    'descr', 'vol', 'vol_exec', 'cost', 'fee', 'price', 'stopprice',
+                    'limitprice', 'misc', 'oflags'
+                ]
+
+                for field in required_order_fields:
+                    if field not in order:
+                        self.logger.error(f"L'ordre {txid} manque le champ {field}")
+                        raise KrakenAPIError(f"L'ordre {txid} manque le champ {field}")
+
+                # Validation des types
+                if not isinstance(order['refid'], (str, type(None))):
+                    self.logger.error(f"Le refid de {txid} n'est pas une chaîne ou None")
+                    raise KrakenAPIError(f"Le refid de {txid} doit être une chaîne ou None")
+
+                if not isinstance(order['userref'], int):
+                    self.logger.error(f"Le userref de {txid} n'est pas un entier")
+                    raise KrakenAPIError(f"Le userref de {txid} doit être un entier")
+
+                if order['status'] not in ['open', 'closed', 'canceled', 'expired']:
+                    self.logger.error(f"Le statut de {txid} est invalide")
+                    raise KrakenAPIError(f"Le statut de {txid} est invalide")
+
+                # Validation des timestamps
+                for field in ['opentm', 'starttm', 'expiretm']:
+                    if not isinstance(order[field], (int, float)):
+                        self.logger.error(f"Le champ {field} de {txid} n'est pas un nombre")
+                        raise KrakenAPIError(f"Le champ {field} de {txid} doit être un nombre")
+
+                # Validation des valeurs numériques
+                for field in ['vol', 'vol_exec', 'cost', 'fee', 'price', 'stopprice', 'limitprice']:
+                    if not isinstance(order[field], (int, float)):
+                        self.logger.error(f"Le champ {field} de {txid} n'est pas un nombre")
+                        raise KrakenAPIError(f"Le champ {field} de {txid} doit être un nombre")
+
+                # Validation des chaînes
+                for field in ['misc', 'oflags']:
+                    if not isinstance(order[field], str):
+                        self.logger.error(f"Le champ {field} de {txid} n'est pas une chaîne")
+                        raise KrakenAPIError(f"Le champ {field} de {txid} doit être une chaîne")
+
+                # Validation de la description
+                if not isinstance(order['descr'], dict):
+                    self.logger.error(f"La description de {txid} n'est pas un dictionnaire")
+                    raise KrakenAPIError(f"La description de {txid} doit être un dictionnaire")
+
+                # Validation des champs de la description
+                required_descr_fields = [
+                    'pair', 'type', 'ordertype', 'price', 'price2', 'leverage',
+                    'order', 'close'
+                ]
+
+                for field in required_descr_fields:
+                    if field not in order['descr']:
+                        self.logger.error(f"La description de {txid} manque le champ {field}")
+                        raise KrakenAPIError(f"La description de {txid} manque le champ {field}")
+
+                # Validation du type
+                if order['descr']['type'] not in ['buy', 'sell']:
+                    self.logger.error(f"Le type de {txid} est invalide")
+                    raise KrakenAPIError(f"Le type de {txid} est invalide")
+
+                # Validation des valeurs numériques dans la description
+                if not isinstance(order['descr']['price'], (int, float)):
+                    self.logger.error(f"Le prix de {txid} dans la description doit être un nombre")
+                    raise KrakenAPIError(f"Le prix de {txid} dans la description doit être un nombre")
+
+                if not isinstance(order['descr']['price2'], (int, float)):
+                    self.logger.error(f"Le prix secondaire de {txid} doit être un nombre")
+                    raise KrakenAPIError(f"Le prix secondaire de {txid} doit être un nombre")
+
+                if not isinstance(order['descr']['leverage'], (int, float)):
+                    self.logger.error(f"Le levier de {txid} doit être un nombre")
+                    raise KrakenAPIError(f"Le levier de {txid} doit être un nombre")
+
+                # Validation des chaînes dans la description
+                if not isinstance(order['descr']['order'], str):
+                    self.logger.error(f"La description complète de {txid} doit être une chaîne")
+                    raise KrakenAPIError(f"La description complète de {txid} doit être une chaîne")
+
+                if not isinstance(order['descr']['close'], str):
+                    self.logger.error(f"La condition de fermeture de {txid} doit être une chaîne")
+                    raise KrakenAPIError(f"La condition de fermeture de {txid} doit être une chaîne")
+
+                self.logger.info(f"Ordre {txid} validé avec succès")
+
+            # Validation des ordres en attente
+            if not all(isinstance(x, str) for x in response['pending']):
+                self.logger.error("Les éléments de 'pending' ne sont pas des chaînes")
+                raise KrakenAPIError("Les éléments de 'pending' doivent être des chaînes")
+
+            self.logger.info("Ordres ouverts récupérés avec succès")
+            return response
+
+        except KrakenAPIError as e:
+            self.logger.error(f"Erreur de l'API Kraken: {str(e)}", exc_info=True)
+            raise KrakenAPIError(f"Erreur de l'API Kraken: {str(e)}")
+
+        except Exception as e:
+            self.logger.error(f"Erreur lors de la récupération des ordres ouverts: {str(e)}", exc_info=True)
+            raise KrakenAPIError(f"Erreur lors de la récupération des ordres ouverts: {str(e)}")
+
+
+    async def get_ohlc(self, pair: str, interval: int = 1, since: Optional[int] = None) -> Dict:
+        """
+        Récupère les données OHLC (Open/High/Low/Close) pour une paire.
+        
+        Args:
+            pair: Paire de trading
+            interval: Intervalle de temps en minutes (1, 5, 15, 30, 60, 240, 1440, 10080, 21600)
+            since: Timestamp depuis lequel récupérer les données (optionnel)
+        
+        Returns:
+            Dictionnaire avec:
+            - last: Timestamp de la dernière bougie
+            - [pair]: Liste des bougies OHLC
+            
+            Chaque bougie contient:
+            - time: Timestamp
+            - open: Prix d'ouverture
+            - high: Prix le plus haut
+            - low: Prix le plus bas
+            - close: Prix de clôture
+            - vwap: Prix moyen pondéré
+            - volume: Volume
+            - count: Nombre de trades
+
+            Raises:
+                ValueError: Si les paramètres sont invalides
+                KrakenAPIError: Si l'API retourne une erreur
+            """
+        try:
+            # Validation du txid
+            if not isinstance(txid, str):
+                self.logger.error(f"txid doit être une chaîne: {txid}")
+                raise ValueError("txid doit être une chaîne")
+            
+            if not txid.strip():
+                self.logger.error("txid ne peut pas être vide ou contenir uniquement des espaces")
+                raise ValueError("txid ne peut pas être vide ou contenir uniquement des espaces")
+            
+            if len(txid) < 10 or len(txid) > 50:
+                self.logger.error(f"txid doit avoir entre 10 et 50 caractères: {len(txid)}")
+                raise ValueError("txid doit avoir entre 10 et 50 caractères")
+        """
+        Annule un ordre.
+        
+        Args:
+            txid: ID de l'ordre à annuler
+            
+        Returns:
+            Dictionnaire avec:
+            - count: Nombre d'ordres annulés
+            - pending: Liste des IDs d'ordres en attente
+            - open: Dictionnaire des ordres ouverts restants
+            - closed: Dictionnaire des ordres fermés
+            
+        Raises:
+            ValueError: Si le txid est invalide
+            KrakenAPIError: Si l'API retourne une erreur
+        """
+        try:
+            # Validation du txid
+            if not isinstance(txid, str):
+                self.logger.error(f"txid doit être une chaîne: {txid}")
+                raise ValueError("txid doit être une chaîne")
+            
+            if not txid.strip():
+                self.logger.error("txid ne peut pas être vide ou contenir uniquement des espaces")
+                raise ValueError("txid ne peut pas être vide ou contenir uniquement des espaces")
+            
+            if len(txid) < 10 or len(txid) > 50:
+                self.logger.error(f"txid doit avoir entre 10 et 50 caractères: {len(txid)}")
+                raise ValueError("txid doit avoir entre 10 et 50 caractères")
+            
+            # Appel à l'API
+            params = {'txid': txid}
+            response = await self._request('POST', 'private/CancelOrder', params, private=True)
+            self.logger.debug(f"Réponse de l'annulation d'ordre: {response}")
+            
+            # Validation générale de la réponse
+            if not isinstance(response, dict):
+                self.logger.error(f"Format de réponse invalide: {response}")
+                raise KrakenAPIError("La réponse doit être un dictionnaire")
+            
+            # Validation du champ count
+            count = response.get('count')
+            if count is None:
+                self.logger.error("La réponse manque le champ 'count'")
+                raise KrakenAPIError("La réponse doit contenir le champ 'count'")
+            
+            if not isinstance(count, int):
+                self.logger.error(f"count doit être un entier: {count}")
+                raise KrakenAPIError("count doit être un entier")
+            
+            if count < 0:
+                self.logger.error(f"count ne peut pas être négatif: {count}")
+                raise KrakenAPIError("count ne peut pas être négatif")
+            
+            # Validation du champ pending
+            pending = response.get('pending')
+            if pending is None:
+                self.logger.error("La réponse manque le champ 'pending'")
+                raise KrakenAPIError("La réponse doit contenir le champ 'pending'")
+            
+            if not isinstance(pending, list):
+                self.logger.error(f"pending doit être une liste: {pending}")
+                raise KrakenAPIError("pending doit être une liste")
+            
+            # Validation des éléments de pending
+            self._validate_pending_orders(response)
+            
+            # Validation des ordres ouverts restants
+            if 'open' in response:
+                self._validate_open_orders(response['open'])
+            
+            # Validation des ordres fermés
+            if 'closed' in response:
+                self._validate_closed_orders(response['closed'])
+            
+            self.logger.info(f"Annulation de l'ordre {txid} réussie")
+            return response
+            
+        except ValueError as e:
+            self.logger.error(f"Erreur de validation: {str(e)}")
+            raise ValueError(f"Erreur de validation: {str(e)}")
+        except KrakenAPIError as e:
+            self.logger.error(f"Erreur de l'API Kraken: {str(e)}")
+            raise KrakenAPIError(f"Erreur de l'API Kraken: {str(e)}")
+        except Exception as e:
+            self.logger.error(f"Erreur lors de l'annulation de l'ordre: {str(e)}")
+            raise KrakenAPIError(f"Erreur lors de l'annulation de l'ordre: {str(e)}")
+
+    async def get_trade_volume(self, pair: Optional[str] = None, fee_info: bool = False) -> Dict[str, Any]:
+        """
+        Récupère le volume de trading et les frais.
+        
+        Args:
+            pair: Paire de trading (optionnel)
+            fee_info: Inclusion des informations sur les frais
+            
+        Returns:
+            Dictionnaire avec:
+            - currency: Devise de référence (str)
+            - volume: Volume de trading (float)
+            - fees: Dictionnaire des frais par paire si fee_info=True
+            Chaque frais contient:
+            - fee: Taux de frais (float)
+            - minfee: Frais minimum (float)
+            - maxfee: Frais maximum (float)
+            - nextfee: Prochain taux de frais (float)
+            
+        Raises:
+            ValueError: Si les paramètres sont invalides
+            KrakenAPIError: Si l'API retourne une erreur
+        """
+        try:
+            # Validation des paramètres
+            if pair is not None and not isinstance(pair, str):
+                self.logger.error(f"Type invalide pour pair: {type(pair).__name__}")
+                raise ValueError("La paire doit être une chaîne ou None")
+
+            if not isinstance(fee_info, bool):
+                self.logger.error(f"Type invalide pour fee_info: {type(fee_info).__name__}")
+                raise ValueError("fee_info doit être un booléen")
+
+            # Préparation des données
+            data = {
+                'fee-info': str(fee_info).lower()
+            }
+            
+            if pair:
+                data['pair'] = pair
+                
+            # Validation de la paire si spécifiée
+            if pair:
+                await self._ensure_pair_altname_map()
+                if pair not in self.pair_altname_map:
+                    self.logger.error(f"Paire inconnue: {pair}")
+                    raise ValueError(f"Paire inconnue: {pair}")
+            
+            # Récupération du volume de trading
+            response = await self._request('POST', 'private/TradeVolume', data, private=True)
+            self.logger.debug(f"Réponse du volume de trading: {response}")
+            
+            # Validation de la réponse
+            if not isinstance(response, dict):
+                self.logger.error(f"Réponse invalide: {response}")
+                raise KrakenAPIError("La réponse du volume de trading n'est pas un dictionnaire")
+
+            # Validation des champs obligatoires
+            required_fields = ['currency', 'volume']
+            for field in required_fields:
+                if field not in response:
+                    self.logger.error(f"Champ manquant: {field}")
+                    raise KrakenAPIError(f"Le champ {field} est manquant dans la réponse")
+
+            # Validation des types
+            if not isinstance(response['currency'], str):
+                self.logger.error(f"Type invalide pour currency: {type(response['currency']).__name__}")
+                raise KrakenAPIError("La devise doit être une chaîne")
+
+            if not isinstance(response['volume'], (int, float)):
+                self.logger.error(f"Type invalide pour volume: {type(response['volume']).__name__}")
+                raise KrakenAPIError("Le volume doit être un nombre")
+
+            # Validation des frais si demandés
+            if fee_info and 'fees' in response:
+                fees = response['fees']
+                if not isinstance(fees, dict):
+                    self.logger.error(f"Type invalide pour fees: {type(fees).__name__}")
+                    raise KrakenAPIError("Les frais doivent être un dictionnaire")
+
+                for pair, fee_data in fees.items():
+                    if not isinstance(fee_data, dict):
+                        self.logger.error(f"Type invalide pour les frais de {pair}: {type(fee_data).__name__}")
+                        raise KrakenAPIError(f"Les frais de {pair} doivent être un dictionnaire")
+
+                    required_fee_fields = ['fee', 'minfee', 'maxfee', 'nextfee']
+                    for field in required_fee_fields:
+                        if field not in fee_data:
+                            self.logger.error(f"Champ manquant dans les frais de {pair}: {field}")
+                            raise KrakenAPIError(f"Le champ {field} est manquant dans les frais de {pair}")
+
+            self.logger.info(f"Récupération du volume de trading réussie")
+            return response
+            
+        except ValueError as e:
+            self.logger.error(f"Erreur de validation: {str(e)}")
+            raise ValueError(f"Erreur de validation: {str(e)}")
+        except KrakenAPIError as e:
+            self.logger.error(f"Erreur de l'API Kraken: {str(e)}")
+            raise KrakenAPIError(f"Erreur de l'API Kraken: {str(e)}")
+        except Exception as e:
+            self.logger.error(f"Erreur lors de la récupération du volume de trading: {str(e)}")
+            raise KrakenAPIError(f"Erreur lors de la récupération du volume de trading: {str(e)}")
+
+                    # Validation des types des frais
+                    if not isinstance(fee_data[field], (int, float)):
+                        self.logger.error(f"Type invalide pour {field} dans les frais de {pair}: {type(fee_data[field]).__name__}")
+                        raise KrakenAPIError(f"Le champ {field} dans les frais de {pair} doit être un nombre")
+
+            self.logger.info(f"Récupération du volume de trading réussie")
+            return response
+            
+        except ValueError as e:
+            self.logger.error(f"Erreur de validation: {str(e)}")
+            raise ValueError(f"Erreur de validation: {str(e)}")
+        except KrakenAPIError as e:
+            self.logger.error(f"Erreur de l'API Kraken: {str(e)}")
+            raise KrakenAPIError(f"Erreur de l'API Kraken: {str(e)}")
+        except Exception as e:
+            self.logger.error(f"Erreur lors de la récupération du volume de trading: {str(e)}")
+            raise KrakenAPIError(f"Erreur lors de la récupération du volume de trading: {str(e)}")
+
+        except KrakenAPIError as e:
+            self.logger.error(f"Erreur de l'API Kraken: {str(e)}", exc_info=True)
+            raise KrakenAPIError(f"Erreur de l'API Kraken: {str(e)}")
+
+        except Exception as e:
+            self.logger.error(f"Erreur lors de la récupération du volume de trading: {str(e)}", exc_info=True)
+            raise KrakenAPIError(f"Erreur lors de la récupération du volume de trading: {str(e)}")
+
+    async def get_assets(self, asset: Optional[str] = None, aclass: Optional[str] = None) -> Dict[str, Any]:
+        """
+        Récupère les informations sur les actifs.
+        
+        Args:
+            asset: Actif (optionnel)
+            aclass: Classe d'actif (optionnel)
+            
+        Returns:
+            Dictionnaire avec les informations sur les actifs:
+            - altname: Nom alternatif
+            - aclass: Classe d'actif
+            - decimals: Nombre de décimales
+            - display_decimals: Nombre de décimales à afficher
+            
+        Raises:
+            ValueError: Si les paramètres sont invalides
+            KrakenAPIError: Si l'API retourne une erreur
+        """
+        try:
+            # Validation des paramètres
+            params = {}
+            
+            # Validation de asset
+            if asset is not None:
+                if not isinstance(asset, str):
+                    self.logger.error(f"Type invalide pour asset: {type(asset).__name__}")
+                    raise ValueError("asset doit être une chaîne")
+                if not asset.strip():
+                    self.logger.error("asset ne peut pas être vide ou contenir uniquement des espaces")
+                    raise ValueError("asset ne peut pas être vide ou contenir uniquement des espaces")
+                params['asset'] = asset
+
+            # Validation de aclass
+            if aclass is not None:
+                if not isinstance(aclass, str):
+                    self.logger.error(f"Type invalide pour aclass: {type(aclass).__name__}")
+                    raise ValueError("La classe d'actif doit être une chaîne")
+                if not aclass.strip():
+                    self.logger.error("aclass ne peut pas être vide ou contenir uniquement des espaces")
+                    raise ValueError("aclass ne peut pas être vide ou contenir uniquement des espaces")
+                params['aclass'] = aclass
+
+            # Récupération des informations sur les actifs
+            response = await self._request('POST', 'private/Assets', params, private=True)
+            self.logger.debug(f"Réponse des actifs: {response}")
+            
+            # Validation de la réponse
+            if not isinstance(response, dict):
+                self.logger.error(f"Réponse invalide: {response}")
+                raise KrakenAPIError("La réponse doit être un dictionnaire")
+
+            # Validation des informations pour chaque actif
+            for asset_name, asset_info in response.items():
+                if not isinstance(asset_info, dict):
+                    self.logger.error(f"Informations invalides pour {asset_name}: {asset_info}")
+                    raise KrakenAPIError(f"Les informations pour {asset_name} doivent être un dictionnaire")
+
+                # Validation des champs requis
+                required_fields = ['altname', 'aclass', 'decimals', 'display_decimals']
+                for field in required_fields:
+                    if field not in asset_info:
+                        self.logger.error(f"Champ manquant pour {asset_name}: {field}")
+                        raise KrakenAPIError(f"Le champ {field} est manquant pour {asset_name}")
+
+                # Validation des types
+                if not isinstance(asset_info['altname'], str):
+                    self.logger.error(f"Type invalide pour altname de {asset_name}: {type(asset_info['altname']).__name__}")
+                    raise KrakenAPIError(f"Le nom alternatif de {asset_name} doit être une chaîne")
+
+                if not isinstance(asset_info['aclass'], str):
+                    self.logger.error(f"Type invalide pour aclass de {asset_name}: {type(asset_info['aclass']).__name__}")
+                    raise KrakenAPIError(f"La classe d'actif de {asset_name} doit être une chaîne")
+
+                if not isinstance(asset_info['decimals'], int):
+                    self.logger.error(f"Type invalide pour decimals de {asset_name}: {type(asset_info['decimals']).__name__}")
+                    raise KrakenAPIError(f"Les décimales de {asset_name} doivent être un entier")
+
+                if not isinstance(asset_info['display_decimals'], int):
+                    self.logger.error(f"Type invalide pour display_decimals de {asset_name}: {type(asset_info['display_decimals']).__name__}")
+                    raise KrakenAPIError(f"Les décimales d'affichage de {asset_name} doivent être un entier")
+
+            self.logger.info(f"Récupération des informations sur les actifs réussie")
+            return response
+            
+        except ValueError as e:
+            self.logger.error(f"Erreur de validation: {str(e)}")
+            raise ValueError(f"Erreur de validation: {str(e)}")
+        except KrakenAPIError as e:
+            self.logger.error(f"Erreur de l'API Kraken: {str(e)}")
+            raise KrakenAPIError(f"Erreur de l'API Kraken: {str(e)}")
+        except Exception as e:
+            self.logger.error(f"Erreur lors de la récupération des informations sur les actifs: {str(e)}")
+            raise KrakenAPIError(f"Erreur lors de la récupération des informations sur les actifs: {str(e)}")
+
+            # Préparation des données
+            data = {}
+            if asset:
+                data['asset'] = asset
+            if aclass:
+                data['aclass'] = aclass
+
+            # Récupération des actifs
+            response = await self._request('POST', 'public/Assets', data)
+            self.logger.debug(f"Réponse des actifs: {response}")
+
+            # Validation de la réponse
+            if not isinstance(response, dict):
+                self.logger.error(f"Réponse invalide: {response}")
+                raise KrakenAPIError("La réponse des actifs n'est pas un dictionnaire")
+                    raise KrakenAPIError(f"Les informations pour l'actif {asset_name} doivent être un dictionnaire")
+
+                for field in required_fields:
+                    if field not in asset_info:
+                        raise KrakenAPIError(f"L'actif {asset_name} manque le champ {field}")
+
+                    if field == 'altname' or field == 'aclass':
+                        if not isinstance(asset_info[field], str):
+                            raise KrakenAPIError(f"Le champ {field} doit être une chaîne")
+                    else:  # decimals, display_decimals
+                        if not isinstance(asset_info[field], int):
+                            raise KrakenAPIError(f"Le champ {field} doit être un entier")
+
+            self.logger.info("Informations sur les actifs récupérées avec succès")
+            return response
+        except ValueError as e:
+            self.logger.error(f"Erreur de validation des paramètres: {str(e)}", exc_info=True)
+            raise ValueError(f"Erreur de validation des paramètres: {str(e)}")
+        except KrakenAPIError as e:
+            self.logger.error(f"Erreur de l'API Kraken: {str(e)}", exc_info=True)
+            raise KrakenAPIError(f"Erreur de l'API Kraken: {str(e)}")
+        except Exception as e:
+            self.logger.error(f"Erreur lors de la récupération des actifs: {str(e)}", exc_info=True)
+            raise KrakenAPIError(f"Erreur lors de la récupération des actifs: {str(e)}")
+
+    async def get_asset_pairs(self, info: Optional[str] = None, pair: Optional[Union[str, List[str]]] = None) -> Dict:
+        """
+        Récupère les informations sur les paires d'actifs.
+        
+        Args:
+            info: Type d'informations à récupérer (optionnel, peut être 'info', 'leverage', 'fees' ou 'margin')
+            pair: Paire(s) d'actifs à récupérer (optionnel, peut être une chaîne ou une liste de chaînes)
+            
+        Returns:
+            Dictionnaire avec les informations sur les paires d'actifs
+            
+            Pour chaque paire, on trouve:
+            - altname: Nom alternatif
+            - aclass_base: Classe d'actif de base
+            - base: Actif de base
+            - aclass_quote: Classe d'actif de quote
+            - quote: Actif de quote
+            - lot: Taille du lot
+            - pair_decimals: Nombre de décimales pour la paire
+            - lot_decimals: Nombre de décimales pour le lot
+            - lot_multiplier: Multiplicateur de lot
+            - leverage_buy: Niveaux de levier pour les achats
+            - leverage_sell: Niveaux de levier pour les ventes
+            - fees: Frais de transaction
+            - fees_maker: Frais de transaction pour les makers
+            - ordermin: Montant minimum pour les ordres
+            
+        Raises:
+            ValueError: Si les paramètres sont invalides
+            KrakenAPIError: Si l'API retourne une erreur
+        """
+        try:
+            # Validation des paramètres
+            if info is not None and not isinstance(info, str):
+                self.logger.error(f"Type invalide pour info: {type(info).__name__}")
+                raise ValueError("Le type d'info doit être une chaîne ou None")
+
+            if info is not None and info not in ['info', 'leverage', 'fees', 'margin']:
+                self.logger.error(f"Type d'info invalide: {info}")
+                raise ValueError("Le type d'info doit être 'info', 'leverage', 'fees' ou 'margin'")
+
+            if pair is not None and not isinstance(pair, (str, list)):
+                self.logger.error(f"Type invalide pour pair: {type(pair).__name__}")
+                raise ValueError("La paire doit être une chaîne, une liste de chaînes ou None")
+
+            if isinstance(pair, list) and not all(isinstance(p, str) for p in pair):
+                self.logger.error(f"Liste de paires invalide: {pair}")
+                raise ValueError("Tous les éléments de la liste de paires doivent être des chaînes")
+
+            # Préparation des données
+            data = {}
+            
+            if info:
+                data['info'] = info
+            
+            if pair:
+                if isinstance(pair, str):
+                    data['pair'] = pair
+                else:
+                    data['pair'] = ','.join(pair)
+
+            # Récupération des informations sur les paires
+            response = await self._request('GET', 'public/AssetPairs', data)
+            self.logger.debug(f"Réponse des paires d'actifs: {response}")
+            
+            # Validation de la réponse
+            if not isinstance(response, dict):
+                self.logger.error(f"Réponse invalide: {response}")
+                raise KrakenAPIError("La réponse des paires d'actifs n'est pas un dictionnaire")
+
+            # Validation des informations sur les paires
+            for pair_name, pair_info in response.items():
+                if not isinstance(pair_info, dict):
+                    self.logger.error(f"Informations invalides pour {pair_name}: {pair_info}")
+                    raise KrakenAPIError(f"Les informations de {pair_name} doivent être un dictionnaire")
+
+                # Validation des champs requis
+                required_fields = ['altname', 'aclass_base', 'base', 'aclass_quote', 'quote', 'lot', 'pair_decimals',
+                                 'lot_decimals', 'lot_multiplier', 'leverage_buy', 'leverage_sell', 'fees', 'fees_maker',
+                                 'ordermin']
+                
+                for field in required_fields:
+                    if field not in pair_info:
+                        self.logger.error(f"Champ manquant pour {pair_name}: {field}")
+                        raise KrakenAPIError(f"La paire {pair_name} manque le champ {field}")
+                    
+                    if field in ['altname', 'aclass_base', 'base', 'aclass_quote', 'quote', 'lot']:
+                        if not isinstance(pair_info[field], str):
+                            self.logger.error(f"Type invalide pour {field} de {pair_name}")
+                            raise KrakenAPIError(f"Le champ {field} doit être une chaîne")
+                    elif field in ['pair_decimals', 'lot_decimals', 'lot_multiplier']:
+                        if not isinstance(pair_info[field], int):
+                            self.logger.error(f"Type invalide pour {field} de {pair_name}")
+                            raise KrakenAPIError(f"Le champ {field} doit être un entier")
+                    elif field in ['leverage_buy', 'leverage_sell']:
+                        if not isinstance(pair_info[field], list):
+                            self.logger.error(f"Type invalide pour {field} de {pair_name}")
+                            raise KrakenAPIError(f"Le champ {field} doit être une liste")
+                    elif field in ['fees', 'fees_maker']:
+                        if not isinstance(pair_info[field], list):
+                            self.logger.error(f"Type invalide pour {field} de {pair_name}")
+                            raise KrakenAPIError(f"Le champ {field} doit être une liste")
+                        for fee in pair_info[field]:
+                            if not isinstance(fee, list) or len(fee) != 2:
+                                self.logger.error(f"Frais invalides pour {pair_name}: {fee}")
+                                raise KrakenAPIError(f"Les frais doivent être une liste de 2 éléments")
+                            if not isinstance(fee[0], (int, float)) or not isinstance(fee[1], (int, float)):
+                                self.logger.error(f"Types invalides pour les frais de {pair_name}: {fee}")
+                                raise KrakenAPIError(f"Les éléments des frais doivent être des nombres")
+                    elif field == 'ordermin':
+                        if not isinstance(pair_info[field], (int, float)):
+                            self.logger.error(f"Type invalide pour ordermin de {pair_name}")
+                            raise KrakenAPIError("ordermin doit être un nombre")
+            
+            self.logger.info("Paires d'actifs récupérées avec succès")
+            return response
+        except ValueError as e:
+            self.logger.error(f"Erreur de validation des paramètres: {str(e)}", exc_info=True)
+            raise ValueError(f"Erreur de validation des paramètres: {str(e)}")
+        except KrakenAPIError as e:
+            self.logger.error(f"Erreur de l'API Kraken: {str(e)}", exc_info=True)
+            raise KrakenAPIError(f"Erreur de l'API Kraken: {str(e)}")
+        except Exception as e:
+            self.logger.error(f"Erreur lors de la récupération du ticker: {str(e)}", exc_info=True)
+            raise KrakenAPIError(f"Erreur lors de la récupération du ticker: {str(e)}")
+
+    async def get_order_book(self, pair: str, count: int = 100) -> Dict:
+        """
+        Récupère le carnet d'ordres pour une paire.
+        
+        Args:
+            pair: Paire de trading
+            count: Nombre d'ordres à récupérer (1-100)
+            
+        Returns:
+            Dictionnaire avec:
+            - asks: Liste des ordres d'ask
+            - bids: Liste des ordres de bid
+            
+            Chaque ordre contient:
+            - price: Prix
+            - volume: Volume
+            - timestamp: Timestamp
+            
+        Raises:
+            ValueError: Si les paramètres sont invalides
+            KrakenAPIError: Si l'API retourne une erreur
+        """
+        try:
+            # Validation des paramètres
+            if not isinstance(pair, str):
+                self.logger.error(f"Type invalide pour pair: {type(pair).__name__}")
+                raise ValueError("La paire doit être une chaîne")
+
+            if not isinstance(count, int) or count <= 0 or count > 100:
+                self.logger.error(f"Valeur invalide pour count: {count}")
+                raise ValueError("Le nombre d'ordres doit être un entier entre 1 et 100")
+
+            # Préparation des données
+            data = {
+                'pair': pair,
+                'count': count
+            }
+
+            # Récupération du carnet d'ordres
+            response = await self._request('GET', 'public/Depth', data)
+            self.logger.debug(f"Réponse du carnet d'ordres: {response}")
+
+            # Validation de la réponse
+            if not isinstance(response, dict):
+                self.logger.error(f"Réponse invalide: {response}")
+                raise KrakenAPIError("La réponse du carnet d'ordres n'est pas un dictionnaire")
+
+            # Validation des données du carnet d'ordres
+            if pair not in response:
+                self.logger.error(f"Paire {pair} non trouvée dans la réponse")
+                raise KrakenAPIError(f"La paire {pair} n'est pas dans la réponse")
+
+            order_book = response[pair]
+            if not isinstance(order_book, dict):
+                self.logger.error(f"Format invalide pour le carnet d'ordres de {pair}")
+                raise KrakenAPIError(f"Le carnet d'ordres de {pair} doit être un dictionnaire")
+
+            required_fields = ['asks', 'bids', 'timestamp']
+            for field in required_fields:
+                if field not in order_book:
+                    self.logger.error(f"Champ {field} manquant pour {pair}")
+                    raise KrakenAPIError(f"Le champ {field} est manquant pour {pair}")
+
+            # Validation des ordres
+            for field in ['asks', 'bids']:
+                orders = order_book[field]
+                if not isinstance(orders, list):
+                    self.logger.error(f"{field} n'est pas une liste pour {pair}")
+                    raise KrakenAPIError(f"{field} doit être une liste pour {pair}")
+
+                # Validation des ordres individuels
+                for order in orders:
+                    if not isinstance(order, list) or len(order) != 3:
+                        self.logger.error(f"Format invalide pour un ordre {field} de {pair}: {order}")
+                        raise KrakenAPIError(f"Un ordre {field} doit être une liste de 3 éléments")
+
+                    price, volume, timestamp = order
+                    
+                    # Validation du prix
+                    if not isinstance(price, (int, float)):
+                        self.logger.error(f"Prix invalide dans un ordre {field} de {pair}: {price}")
+                        raise KrakenAPIError(f"Le prix dans un ordre {field} doit être un nombre")
+                    if price <= 0:
+                        self.logger.error(f"Prix négatif ou nul dans un ordre {field} de {pair}: {price}")
+                        raise KrakenAPIError(f"Le prix dans un ordre {field} doit être strictement positif")
+                    if isinstance(price, float):
+                        if math.isnan(price) or math.isinf(price):
+                            self.logger.error(f"Prix invalide (NaN ou infini) dans un ordre {field} de {pair}: {price}")
+                            raise KrakenAPIError(f"Le prix dans un ordre {field} contient une valeur invalide")
+                    if price > 1e12:  # Vérification arbitraire pour éviter les valeurs extrêmes
+                        self.logger.error(f"Prix extrêmement élevé dans un ordre {field} de {pair}: {price}")
+                        raise KrakenAPIError(f"Le prix dans un ordre {field} est trop élevé")
+
+                    # Validation du volume
+                    if not isinstance(volume, (int, float)):
+                        self.logger.error(f"Volume invalide dans un ordre {field} de {pair}: {volume}")
+                        raise KrakenAPIError(f"Le volume dans un ordre {field} doit être un nombre")
+                    if volume <= 0:
+                        self.logger.error(f"Volume négatif ou nul dans un ordre {field} de {pair}: {volume}")
+                        raise KrakenAPIError(f"Le volume dans un ordre {field} doit être strictement positif")
+                    if isinstance(volume, float):
+                        if math.isnan(volume) or math.isinf(volume):
+                            self.logger.error(f"Volume invalide (NaN ou infini) dans un ordre {field} de {pair}: {volume}")
+                            raise KrakenAPIError(f"Le volume dans un ordre {field} contient une valeur invalide")
+                    if volume > 1e12:  # Vérification arbitraire pour éviter les valeurs extrêmes
+                        self.logger.error(f"Volume extrêmement élevé dans un ordre {field} de {pair}: {volume}")
+                        raise KrakenAPIError(f"Le volume dans un ordre {field} est trop élevé")
+
+                    # Validation du timestamp
+                    if not isinstance(timestamp, (int, float)):
+                        self.logger.error(f"Timestamp invalide dans un ordre {field} de {pair}: {timestamp}")
+                        raise KrakenAPIError(f"Le timestamp dans un ordre {field} doit être un nombre")
+                    if timestamp < 0:
+                        self.logger.error(f"Timestamp négatif dans un ordre {field} de {pair}: {timestamp}")
+                        raise KrakenAPIError(f"Le timestamp dans un ordre {field} ne peut pas être négatif")
+                    if timestamp > time.time():
+                        self.logger.error(f"Timestamp futur dans un ordre {field} de {pair}: {timestamp}")
+                        raise KrakenAPIError(f"Le timestamp dans un ordre {field} ne peut pas être dans le futur")
+
+            # Validation du timestamp
+            if not isinstance(order_book['timestamp'], (int, float)):
+                self.logger.error(f"Timestamp invalide pour {pair}: {order_book['timestamp']}")
+                raise KrakenAPIError(f"Le timestamp du carnet d'ordres doit être un nombre")
+
+            self.logger.info(f"Carnet d'ordres récupéré avec succès pour {pair}")
+            return response
+        except ValueError as e:
+            self.logger.error(f"Erreur de validation des paramètres: {str(e)}", exc_info=True)
+
+                if lowest_ask <= highest_bid:
+                    self.logger.error(f"Incohérence des prix: lowest_ask={lowest_ask}, highest_bid={highest_bid}")
+                    raise KrakenAPIError("Le prix le plus bas des asks doit être strictement supérieur au prix le plus haut des bids")
+
+                # Vérification de l'ordre croissant des asks
+                for i in range(len(asks) - 1):
+                    if float(asks[i][0]) >= float(asks[i + 1][0]):
+                        self.logger.error(f"Ordre des asks non respecté: ask[{i}]={asks[i][0]}, ask[{i+1}]={asks[i+1][0]}")
+                        raise KrakenAPIError("Les prix des asks doivent être dans l'ordre croissant")
+
+                # Vérification de l'ordre décroissant des bids
+                for i in range(len(bids) - 1):
+                    if float(bids[i][0]) <= float(bids[i + 1][0]):
+                        self.logger.error(f"Ordre des bids non respecté: bid[{i}]={bids[i][0]}, bid[{i+1}]={bids[i+1][0]}")
+                        raise KrakenAPIError("Les prix des bids doivent être dans l'ordre décroissant")
+
+            self.logger.info(f"Récupération du carnet d'ordres pour {pair} réussie")
+            return response
+
+        except ValueError as e:
+            self.logger.error(f"Erreur de validation: {str(e)}")
+            raise ValueError(f"Erreur de validation: {str(e)}")
+        except KrakenAPIError as e:
+            self.logger.error(f"Erreur de l'API Kraken: {str(e)}")
+            raise KrakenAPIError(f"Erreur de l'API Kraken: {str(e)}")
+        except Exception as e:
+            self.logger.error(f"Erreur lors de la récupération du carnet d'ordres: {str(e)}")
+            raise KrakenAPIError(f"Erreur lors de la récupération du carnet d'ordres: {str(e)}")
+
+    async def get_recent_trades(self, pair: str, since: Optional[int] = None) -> Dict:
+        """
+        Récupère les trades récents pour une paire.
+        
+        Args:
+            pair: Paire de trading (str)
+            since: Timestamp depuis lequel récupérer les trades (optionnel)
+            
+        Returns:
+            Dictionnaire avec:
+            - trades: Liste des trades
+            - last: Timestamp du dernier trade
+            
+            Chaque trade contient:
+            - price: Prix
+            - volume: Volume
+            - time: Timestamp
+            - side: Côté (buy/sell)
+            - type: Type de trade (market/limit)
+            - misc: Informations supplémentaires
+            
+        Raises:
+            ValueError: Si les paramètres sont invalides
+            KrakenAPIError: Si l'API retourne une erreur
+        """
+        try:
+            # Validation des paramètres
+            if not isinstance(pair, str):
+                self.logger.error(f"Type invalide pour pair: {type(pair).__name__}")
+                raise ValueError("La paire doit être une chaîne")
+            if not pair.strip():
+                self.logger.error("pair vide ou contenant uniquement des espaces")
+                raise ValueError("La paire ne peut pas être vide ou contenir uniquement des espaces")
+            if len(pair) > 20:
+                self.logger.error(f"Longueur invalide pour pair: {len(pair)}")
+                raise ValueError("La paire ne doit pas dépasser 20 caractères")
+
+            if since is not None:
+                if not isinstance(since, (int, float)):
+                    self.logger.error(f"Type invalide pour since: {type(since).__name__}")
+                    raise ValueError("since doit être un nombre")
+                if since < 0:
+                    self.logger.error(f"since négatif: {since}")
+                    raise ValueError("since ne peut pas être négatif")
+
+            # Préparation des paramètres
+            params = {'pair': pair}
+            if since is not None:
+                params['since'] = since
+
+            # Appel à l'API
+            response = await self._request('POST', 'public/Trades', params)
+
+            # Validation de la réponse
+            if not isinstance(response, dict):
+                self.logger.error(f"Format de réponse invalide: {response}")
+                raise KrakenAPIError("La réponse doit être un dictionnaire")
+
+            # Validation des trades
+            trades = response.get('result', {}).get(pair, [])
+            if not isinstance(trades, list):
+                self.logger.error(f"Format invalide pour les trades: {trades}")
+                raise KrakenAPIError("Les trades doivent être une liste")
+
+            # Validation de chaque trade
+            for trade in trades:
+                if not isinstance(trade, list) or len(trade) != 6:
+                    self.logger.error(f"Format invalide pour un trade: {trade}")
+                    raise KrakenAPIError("Chaque trade doit être une liste de 6 éléments")
+
+                price, volume, time, side, type_, misc = trade
+
+                # Validation des types
+                if not isinstance(price, (int, float)):
+                    self.logger.error(f"Prix invalide: {price}")
+                    raise KrakenAPIError("Le prix doit être un nombre")
+                if isinstance(price, float):
+                    if math.isnan(price) or math.isinf(price):
+                        self.logger.error(f"Prix contient NaN ou infini: {price}")
+                        raise KrakenAPIError("Le prix ne peut pas contenir NaN ou infini")
+                if price <= 0:
+                    self.logger.error(f"Prix négatif ou nul: {price}")
+                    raise KrakenAPIError("Le prix ne peut pas être négatif ou nul")
+
+                if not isinstance(volume, (int, float)):
+                    self.logger.error(f"Volume invalide: {volume}")
+                    raise KrakenAPIError("Le volume doit être un nombre")
+                if isinstance(volume, float):
+                    if math.isnan(volume) or math.isinf(volume):
+                        self.logger.error(f"Volume contient NaN ou infini: {volume}")
+                        raise KrakenAPIError("Le volume ne peut pas contenir NaN ou infini")
+                if volume <= 0:
+                    self.logger.error(f"Volume négatif ou nul: {volume}")
+                    raise KrakenAPIError("Le volume ne peut pas être négatif ou nul")
+
+                if not isinstance(time, (int, float)):
+                    self.logger.error(f"Timestamp invalide: {time}")
+                    raise KrakenAPIError("Le timestamp doit être un nombre")
+                if isinstance(time, float):
+                    if math.isnan(time) or math.isinf(time):
+                        self.logger.error(f"Timestamp contient NaN ou infini: {time}")
+                        raise KrakenAPIError("Le timestamp ne peut pas contenir NaN ou infini")
+                if time < 0:
+                    self.logger.error(f"Timestamp négatif: {time}")
+                    raise KrakenAPIError("Le timestamp ne peut pas être négatif")
+
+                if not isinstance(side, str):
+                    self.logger.error(f"Côté invalide: {side}")
+                    raise KrakenAPIError("Le côté doit être une chaîne")
+                if side not in ['b', 's']:
+                    self.logger.error(f"Côté invalide: {side}")
+                    raise KrakenAPIError("Le côté doit être 'b' (buy) ou 's' (sell)")
+
+                if not isinstance(type_, str):
+                    self.logger.error(f"Type invalide: {type_}")
+                    raise KrakenAPIError("Le type doit être une chaîne")
+                if type_ not in ['m', 'l']:
+                    self.logger.error(f"Type invalide: {type_}")
+                    raise KrakenAPIError("Le type doit être 'm' (market) ou 'l' (limit)")
+
+                if not isinstance(misc, str):
+                    self.logger.error(f"Informations supplémentaires invalides: {misc}")
+                    raise KrakenAPIError("Les informations supplémentaires doivent être une chaîne")
+
+            # Validation du last
+            last = response.get('result', {}).get('last')
+            if last is not None:
+                if not isinstance(last, (int, float)):
+                    self.logger.error(f"last invalide: {last}")
+                    raise KrakenAPIError("last doit être un nombre")
+                if isinstance(last, float):
+                    if math.isnan(last) or math.isinf(last):
+                        self.logger.error(f"last contient NaN ou infini: {last}")
+                        raise KrakenAPIError("last ne peut pas contenir NaN ou infini")
+                if last < 0:
+                    self.logger.error(f"last négatif: {last}")
+                    raise KrakenAPIError("last ne peut pas être négatif")
+
+            self.logger.info(f"Récupération des trades récents réussie pour {pair}")
+            return response
+
+        except ValueError as e:
+            self.logger.error(f"Erreur de validation des paramètres: {str(e)}")
+                if volume <= 0:
+                    self.logger.error(f"Volume négatif ou nul dans un trade de {pair}: {volume}")
+                    raise KrakenAPIError(f"Le volume dans un trade de {pair} doit être strictement positif")
+                if isinstance(volume, float):
+                    if math.isnan(volume) or math.isinf(volume):
+                        self.logger.error(f"Volume invalide (NaN ou infini) dans un trade de {pair}: {volume}")
+                        raise KrakenAPIError(f"Le volume dans un trade de {pair} contient une valeur invalide")
+
+                # Validation du timestamp
+                if not isinstance(timestamp, int):
+                    self.logger.error(f"Timestamp invalide dans un trade de {pair}: {timestamp}")
+                    raise KrakenAPIError(f"Le timestamp dans un trade de {pair} doit être un entier")
+                if timestamp < 0:
+                    self.logger.error(f"Timestamp invalide (négatif) dans un trade de {pair}: {timestamp}")
+                    raise KrakenAPIError(f"Le timestamp dans un trade de {pair} doit être positif")
+                if timestamp > time.time():
+                    self.logger.error(f"Timestamp futur dans un trade de {pair}: {timestamp}")
+                    raise KrakenAPIError(f"Le timestamp dans un trade de {pair} ne peut pas être dans le futur")
+
+                # Validation du côté
+                if not isinstance(side, str) or side not in ['b', 's']:
+                    self.logger.error(f"Côté invalide dans un trade de {pair}: {side}")
+                    raise KrakenAPIError(f"Le côté dans un trade de {pair} doit être 'b' ou 's'")
+
+                # Validation du type de trade
+                if not isinstance(trade_type, str) or trade_type not in ['l', 'm']:
+                    self.logger.error(f"Type invalide dans un trade de {pair}: {trade_type}")
+                    raise KrakenAPIError(f"Le type dans un trade de {pair} doit être 'l' ou 'm'")
+
+                if not isinstance(misc, str):
+                    self.logger.error(f"Informations additionnelles invalides dans un trade de {pair}: {misc}")
+                    raise KrakenAPIError(f"Les informations additionnelles dans un trade de {pair} doivent être une chaîne")
+
+            # Validation du timestamp last
+            if 'last' not in response:
+                self.logger.error(f"Champ last manquant pour {pair}")
+                raise KrakenAPIError(f"Le champ last est manquant pour {pair}")
+
+            if not isinstance(response['last'], int):
+                self.logger.error(f"Timestamp last invalide pour {pair}: {response['last']}")
+                raise KrakenAPIError(f"Le timestamp last de {pair} doit être un entier")
+
+            self.logger.info(f"Trades récents récupérés avec succès pour {pair}")
+            return response
+        except ValueError as e:
+            self.logger.error(f"Erreur de validation des paramètres: {str(e)}", exc_info=True)
+            raise ValueError(f"Erreur de validation des paramètres: {str(e)}")
+        except KrakenAPIError as e:
+            self.logger.error(f"Erreur de l'API Kraken: {str(e)}", exc_info=True)
+            raise KrakenAPIError(f"Erreur de l'API Kraken: {str(e)}")
+        except Exception as e:
+            self.logger.error(f"Erreur lors de la récupération des trades récents: {str(e)}", exc_info=True)
+            raise KrakenAPIError(f"Erreur lors de la récupération des trades récents: {str(e)}")
+
+    async def get_ohlc(self, pair: str, interval: int = 1, since: Optional[int] = None) -> Dict:
+        """
+        Récupère les données OHLC pour une paire.
+        
+        Args:
+            pair: Paire de trading
+            interval: Intervalle de temps en minutes (1, 5, 15, 30, 60, 240, 1440, 10080, 21600)
+            since: Timestamp depuis lequel récupérer les données (optionnel)
+            
+        Returns:
+            Dictionnaire avec:
+            - last: Timestamp de la dernière bougie
+            - [pair]: Liste des bougies OHLC
+            
+            Chaque bougie contient:
+            - time: Timestamp
+            - open: Prix d'ouverture
+            - high: Prix le plus haut
+            - low: Prix le plus bas
+            - close: Prix de clôture
+            - vwap: Prix moyen pondéré
+            - volume: Volume
+            - count: Nombre de trades
+            
+        Raises:
+            ValueError: Si les paramètres sont invalides
+            KrakenAPIError: Si l'API retourne une erreur
+        """
+        try:
+            # Validation des paramètres
+            if not isinstance(pair, str):
+                self.logger.error(f"Type invalide pour pair: {type(pair).__name__}")
+                raise ValueError("La paire doit être une chaîne")
+
+            valid_intervals = [1, 5, 15, 30, 60, 240, 1440, 10080, 21600]
+            if interval not in valid_intervals:
+                self.logger.error(f"Intervalle invalide: {interval}")
+                raise ValueError(f"L'intervalle doit être l'un des suivants: {', '.join(map(str, valid_intervals))}")
+
+            if since is not None:
+                if not isinstance(since, int):
+                    self.logger.error(f"Type invalide pour since: {type(since).__name__}")
+                    raise ValueError("Le timestamp since doit être un entier")
+                if since < 0:
+                    self.logger.error(f"Valeur invalide pour since: {since}")
+                    raise ValueError("Le timestamp since doit être positif")
+
+            # Préparation des données
+            data = {
+                'pair': pair,
+                'interval': interval
+            }
+            if since is not None:
+                data['since'] = since
+
+            # Récupération des données OHLC
+            response = await self._request('GET', 'public/OHLC', data)
+            self.logger.debug(f"Réponse OHLC: {response}")
+
+            # Validation de la réponse
+            if not isinstance(response, dict):
+                self.logger.error(f"Réponse invalide: {response}")
+                raise KrakenAPIError("La réponse OHLC n'est pas un dictionnaire")
+
+            # Validation des données OHLC
+            if pair not in response:
+                self.logger.error(f"Paire {pair} non trouvée dans la réponse")
+                raise KrakenAPIError(f"La paire {pair} n'est pas dans la réponse")
+
+            ohlc_data = response[pair]
+            if not isinstance(ohlc_data, list):
+                self.logger.error(f"Format invalide pour les données OHLC de {pair}")
+                raise KrakenAPIError(f"Les données OHLC de {pair} doivent être une liste")
+
+            # Validation des bougies
+            for candle in ohlc_data:
+                if not isinstance(candle, list) or len(candle) != 8:
+                    self.logger.error(f"Format invalide pour une bougie de {pair}: {candle}")
+                    raise KrakenAPIError(f"Une bougie de {pair} doit être une liste de 8 éléments")
+
+                time, open_price, high, low, close, vwap, volume, count = candle
+
+                if not isinstance(time, int):
+                    self.logger.error(f"Timestamp invalide dans une bougie de {pair}: {time}")
+                    raise KrakenAPIError(f"Le timestamp dans une bougie de {pair} doit être un entier")
+
+                # Validation des prix
+                for price in [open_price, high, low, close, vwap]:
+                    if not isinstance(price, (int, float)):
+                        self.logger.error(f"Prix invalide dans une bougie de {pair}: {price}")
+                        raise KrakenAPIError(f"Les prix dans une bougie de {pair} doivent être des nombres")
+                    if isinstance(price, float):
+                        if math.isnan(price) or math.isinf(price):
+                            self.logger.error(f"Prix invalide (NaN ou infini) dans une bougie de {pair}: {price}")
+                            raise KrakenAPIError(f"Les prix dans une bougie de {pair} contiennent des valeurs invalides")
+                    if price <= 0:
+                        self.logger.error(f"Prix négatif ou nul dans une bougie de {pair}: {price}")
+                        raise KrakenAPIError(f"Les prix dans une bougie de {pair} doivent être strictement positifs")
+                    if price > 1e12:  # Vérification arbitraire pour éviter les valeurs extrêmes
+                        self.logger.error(f"Prix extrêmement élevé dans une bougie de {pair}: {price}")
+                        raise KrakenAPIError(f"Le prix dans une bougie de {pair} est trop élevé")
+
+                # Validation du volume
+                if not isinstance(volume, (int, float)):
+                    self.logger.error(f"Volume invalide dans une bougie de {pair}: {volume}")
+                    raise KrakenAPIError(f"Le volume dans une bougie de {pair} doit être un nombre")
+                if isinstance(volume, float):
+                    if math.isnan(volume) or math.isinf(volume):
+                        self.logger.error(f"Volume invalide (NaN ou infini) dans une bougie de {pair}: {volume}")
+                        raise KrakenAPIError(f"Le volume dans une bougie de {pair} contient une valeur invalide")
+                if volume < 0:
+                    self.logger.error(f"Volume négatif dans une bougie de {pair}: {volume}")
+                    raise KrakenAPIError(f"Le volume dans une bougie de {pair} ne peut pas être négatif")
+                if volume > 1e12:  # Vérification arbitraire pour éviter les valeurs extrêmes
+                    self.logger.error(f"Volume extrêmement élevé dans une bougie de {pair}: {volume}")
+                    raise KrakenAPIError(f"Le volume dans une bougie de {pair} est trop élevé")
+
+                # Validation du nombre de trades
+                if not isinstance(count, int):
+                    self.logger.error(f"Nombre de trades invalide dans une bougie de {pair}: {count}")
+                    raise KrakenAPIError(f"Le nombre de trades dans une bougie de {pair} doit être un entier")
+                if count < 0:
+                    self.logger.error(f"Nombre de trades négatif dans une bougie de {pair}: {count}")
+                    raise KrakenAPIError(f"Le nombre de trades dans une bougie de {pair} ne peut pas être négatif")
+
+                # Validation du timestamp
+                if not isinstance(time, int):
+                    self.logger.error(f"Timestamp invalide dans une bougie de {pair}: {time}")
+                    raise KrakenAPIError(f"Le timestamp dans une bougie de {pair} doit être un entier")
+                if time < 0:
+                    self.logger.error(f"Timestamp négatif dans une bougie de {pair}: {time}")
+                    raise KrakenAPIError(f"Le timestamp dans une bougie de {pair} ne peut pas être négatif")
+                if time > time.time():
+                    self.logger.error(f"Timestamp futur dans une bougie de {pair}: {time}")
+                    raise KrakenAPIError(f"Le timestamp dans une bougie de {pair} ne peut pas être dans le futur")
+
+                # Validation de la cohérence des prix
+                if not (low <= open_price <= high and low <= close <= high):
+                    self.logger.error(f"Incohérence des prix dans une bougie de {pair}: "
+                                   f"low={low}, open={open_price}, close={close}, high={high}")
+                    raise KrakenAPIError(f"Les prix dans une bougie de {pair} sont incohérents. "
+                                       f"La logique doit être: low <= open/close <= high")
+
+            # Validation du timestamp last
+            if 'last' not in response:
+                self.logger.error(f"Champ last manquant pour {pair}")
+                raise KrakenAPIError(f"Le champ last est manquant pour {pair}")
+
+            if not isinstance(response['last'], int):
+                self.logger.error(f"Timestamp last invalide pour {pair}: {response['last']}")
+                raise KrakenAPIError(f"Le timestamp last de {pair} doit être un entier")
+
+            self.logger.info(f"Données OHLC récupérées avec succès pour {pair}")
+            return response
+        except ValueError as e:
+            self.logger.error(f"Erreur de validation des paramètres: {str(e)}", exc_info=True)
+            raise ValueError(f"Erreur de validation des paramètres: {str(e)}")
+        except KrakenAPIError as e:
+            self.logger.error(f"Erreur de l'API Kraken: {str(e)}", exc_info=True)
+            raise KrakenAPIError(f"Erreur de l'API Kraken: {str(e)}")
+        except Exception as e:
+            self.logger.error(f"Erreur lors de la récupération des données OHLC: {str(e)}", exc_info=True)
+            raise KrakenAPIError(f"Erreur lors de la récupération des données OHLC: {str(e)}")

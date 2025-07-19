@@ -1,0 +1,144 @@
+# Configuration du bot de trading Kraken
+
+# Paramètres généraux
+general:
+  log_level: "INFO"  # DEBUG, INFO, WARNING, ERROR, CRITICAL
+  base_currency: "USD"
+  quote_currency: "USDT"
+  test_mode: false
+  dry_run: true  # Mode simulation sans passer d'ordres réels
+
+# Configuration de l'API Kraken
+kraken:
+  api_key: "${KRAKEN_API_KEY}"  # À définir dans .env
+  api_secret: "${KRAKEN_API_SECRET}"  # À définir dans .env
+  api_timeout: 30  # secondes
+  max_retries: 3
+  retry_delay: 5  # secondes
+
+# Paires de trading et timeframes
+trading:
+  pairs:
+    - "XBT/USD"
+    - "ETH/USD"
+    - "ADA/USD"
+    - "DOT/USD"
+    - "SOL/USD"
+  
+  timeframes:
+    - "1h"  # Court terme
+    - "4h"  # Moyen terme
+    - "1d"  # Long terme
+  
+  max_open_positions: 5
+  max_position_size: 0.1  # 10% du capital par position
+  max_leverage: 3.0
+
+# Stratégies
+strategies:
+  # Stratégie Momentum
+  momentum:
+    enabled: true
+    weight: 0.4  # Poids dans la décision globale
+    params:
+      rsi_period: 14
+      rsi_overbought: 70
+      rsi_oversold: 30
+      macd_fast: 12
+      macd_slow: 26
+      macd_signal: 9
+  
+  # Stratégie Mean Reversion
+  mean_reversion:
+    enabled: true
+    weight: 0.3
+    params:
+      bollinger_period: 20
+      bollinger_std: 2.0
+      rsi_period: 14
+      rsi_overbought: 70
+      rsi_oversold: 30
+  
+  # Stratégie Breakout
+  breakout:
+    enabled: true
+    weight: 0.3
+    params:
+      atr_period: 14
+      atr_multiplier: 2.0
+      min_volume: 1000  # Volume minimum en devise de base
+
+# Gestion des risques
+risk_management:
+  # Gestion du capital
+  max_risk_per_trade: 0.02  # 2% du capital par trade
+  max_daily_drawdown: 0.1   # 10% de drawdown quotidien max
+  max_consecutive_losses: 5  # Arrêt après 5 pertes consécutives
+  
+  # Stop-loss dynamique
+  stop_loss:
+    enabled: true
+    atr_multiplier: 2.0
+    trailing: true
+    trailing_deviation: 0.5  # 0.5% de marge pour le trailing stop
+  
+  # Take-profit
+  take_profit:
+    enabled: true
+    risk_reward_ratio: 2.0  # Ratio risque/rendement minimum
+    trailing: true
+    trailing_deviation: 0.3  # 0.3% de marge pour le trailing take-profit
+
+# Paramètres de backtesting
+backtest:
+  start_date: "2023-01-01"
+  end_date: "2023-12-31"
+  initial_balance: 10000  # Montant initial en devise de cotation
+  commission: 0.001  # 0.1% de commission par trade
+  slippage: 0.0005  # 0.05% de slippage moyen
+
+# Paramètres d'optimisation
+optimization:
+  method: "genetic"  # genetic, grid, random
+  generations: 10
+  population_size: 50
+  mutation_rate: 0.1
+  crossover_rate: 0.8
+  n_jobs: -1  # Nombre de cœurs CPU à utiliser (-1 = tous)
+
+# Paramètres de journalisation
+logging:
+  file_logging: true
+  log_file: "logs/trading.log"
+  error_file: "logs/errors.log"
+  max_size_mb: 10  # Taille maximale des fichiers de log en Mo
+  backup_count: 5  # Nombre de fichiers de sauvegarde à conserver
+
+# Paramètres de notification
+notifications:
+  telegram:
+    enabled: false
+    bot_token: "${TELEGRAM_BOT_TOKEN}"  # À définir dans .env
+    chat_id: "${TELEGRAM_CHAT_ID}"  # À définir dans .env
+  
+  email:
+    enabled: false
+    smtp_server: "smtp.gmail.com"
+    smtp_port: 587
+    smtp_user: "${EMAIL_USER}"  # À définir dans .env
+    smtp_password: "${EMAIL_PASSWORD}"  # À définir dans .env
+    sender: "bot@example.com"
+    recipients: ["user@example.com"]
+
+# Paramètres de la base de données
+database:
+  enabled: true
+  dialect: "postgresql"  # postgresql, sqlite, mysql
+  host: "localhost"
+  port: 5432
+  name: "kraken_bot"
+  user: "${DB_USER}"  # À définir dans .env
+  password: "${DB_PASSWORD}"  # À définir dans .env
+  pool_size: 10
+  max_overflow: 5
+  echo: false  # Afficher les requêtes SQL (désactiver en production)

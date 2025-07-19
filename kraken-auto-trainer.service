@@ -1,0 +1,17 @@
+[Unit]
+Description=Kraken ML Auto-Trainer Service
+After=network.target postgresql.service
+
+[Service]
+Type=simple
+User=selim
+WorkingDirectory=/Users/selim/Desktop/kraken-project
+ExecStart=/Users/selim/Desktop/kraken-project/.venv/bin/python /Users/selim/Desktop/kraken-project/auto_train.py
+Restart=always
+RestartSec=10
+StandardOutput=file:/var/log/kraken/auto-trainer.log
+StandardError=file:/var/log/kraken/auto-trainer-error.log
+Environment="PYTHONUNBUFFERED=1"
+
+[Install]
+WantedBy=multi-user.target

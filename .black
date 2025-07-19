@@ -1,0 +1,29 @@
+[tool.black]
+line-length = 88
+target-version = ['py310']
+include = '\.pyi?$'
+extend-exclude = '''
+# Fichiers et dossiers à exclure
+/(
+    \.git
+  | \.mypy_cache
+  | \.pytest_cache
+  | \.venv
+  | build
+  | dist
+  | venv
+  | env
+  | docs
+  | \.eggs
+  | \.github
+  | \.idea
+  | \.vscode
+  | \.ipynb_checkpoints
+  | __pycache__
+  | \.pytest_cache
+  | \.mypy_cache
+  | \.coverage
+  | htmlcov
+  | \.hypothesis
+)/
+'''

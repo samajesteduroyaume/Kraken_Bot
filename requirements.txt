@@ -1,0 +1,36 @@
+python-dotenv>=1.0.0  # Gestion des variables d'environnement
+pyyaml>=6.0.1  # Parsing YAML
+pydantic>=1.10.7  # Validation de données
+loguru>=0.7.0  # Logging
+structlog>=22.1.0  # Logging structuré
+pandas>=2.0.0  # Manipulation de données
+numpy>=1.26.0  # Calcul numérique
+polars>=0.19.0  # DataFrame rapide
+pyarrow>=12.0.0  # Manipulation de données
+scikit-learn>=1.4.0  # Machine Learning
+xgboost>=2.0.0  # Machine Learning
+ta>=0.10.2  # Indicateurs techniques
+ccxt>=4.0.0  # API crypto-exchanges
+krakenex>=2.2.2  # API Kraken
+sqlalchemy>=2.0.12  # ORM SQL
+asyncpg>=0.29.0  # PostgreSQL async
+uvicorn>=0.21.1  # Serveur ASGI
+fastapi>=0.95.0  # API REST
+pytest>=7.4.0  # Tests
+pytest-asyncio>=0.21.0  # Tests async
+pytest-mock>=3.11.0  # Mocking
+pytest-cov>=4.1.0  # Couverture
+coverage>=7.3.0  # Couverture
+black>=23.10.0  # Formattage
+isort>=5.12.0  # Organisation imports
+flake8>=6.1.0  # Linting
+mypy>=1.6.1  # Typage statique
+
+# Monitoring et Reporting
+redis>=5.0.1  # Cache et Pub/Sub
+matplotlib>=3.8.0  # Graphiques
+seaborn>=0.12.2  # Visualisation
+boto3>=1.34.0  # AWS S3
+
+tensorflow>=2.19.0  # Deep Learning
+torch>=2.2.0  # PyTorch pour ML
