@@ -3,24 +3,161 @@
 [![Python 3.12+](https://img.shields.io/badge/Python-3.12+-blue.svg)](https://www.python.org/)
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](https://opensource.org/licenses/MIT)
 [![Code style: black](https://img.shields.io/badge/code%20style-black-000000.svg)](https://github.com/psf/black)
-[![Documentation](https://img.shields.io/badge/docs-latest-brightgreen.svg)](#documentation)
+[![Documentation](https://img.shields.io/badge/docs-latest-brightgreen.svg)](https://github.com/yourusername/Kraken_Bot/tree/main/docs)
 [![GitHub stars](https://img.shields.io/github/stars/yourusername/Kraken_Bot?style=social)](https://github.com/yourusername/Kraken_Bot)
+[![Contributions Welcome](https://img.shields.io/badge/contributions-welcome-brightgreen.svg)](CONTRIBUTING.md)
+[![PRs Welcome](https://img.shields.io/badge/PRs-welcome-brightgreen.svg)](https://github.com/yourusername/Kraken_Bot/pulls)
 
 ## 📋 Présentation
-Kraken_Bot est une plateforme de trading algorithmique avancée pour la bourse Kraken, intégrant des stratégies de trading sophistiquées, de l'apprentissage automatique, une gestion avancée des risques et un monitoring complet.
 
-### 🎯 Objectifs
-- Automatisation du trading sur Kraken avec des stratégies robustes
-- Gestion professionnelle des risques
-- Analyse technique et prédictive avancée
-- Interface utilisateur intuitive
-- Architecture modulaire et extensible
+Kraken_Bot est une plateforme de trading algorithmique avancée pour la bourse Kraken. Développée en Python, elle intègre des stratégies de trading sophistiquées, de l'apprentissage automatique, une gestion avancée des risques et un monitoring complet.
 
-### 👥 Public visé
-- Traders algorithmiques
-- Développeurs Python
-- Chercheurs en finance quantitative
-- Passionnés de trading automatisé
+### 🎯 Fonctionnalités Clés
+
+- 🚀 **Trading Automatique** sur la plateforme Kraken
+- 📊 **Stratégies Intégrées** : Momentum, Mean Reversion, Breakout, etc.
+- 🛡️ **Gestion des Risques** avancée avec stop-loss dynamique
+- 🤖 **Machine Learning** pour l'analyse prédictive
+- 📈 **Backtesting** intégré pour valider les stratégies
+- 📱 **Interface en Ligne de Commande** intuitive
+- 🧠 **Architecture Modulaire** et facilement extensible
+- 📊 **Tableaux de Bord** pour le suivi des performances
+
+### 🏗️ Architecture Technique
+
+```mermaid
+graph TD
+    A[Interface Utilisateur] --> B[Core Trading]
+    B --> C[Stratégies]
+    B --> D[Gestion des Risques]
+    B --> E[Exécution des Ordres]
+    C --> F[Analyse Technique]
+    D --> G[Gestion du Capital]
+    E --> H[API Kraken]
+    I[Base de Données] <--> B
+    J[Cache Redis] <-> B
+```
+
+## 🚀 Démarrage Rapide
+
+### Prérequis
+
+- Python 3.12+
+- PostgreSQL
+- Redis
+- Compte Kraken avec clés API
+
+### Installation
+
+1. **Cloner le dépôt** :
+   ```bash
+   git clone https://github.com/yourusername/Kraken_Bot.git
+   cd Kraken_Bot
+   ```
+
+2. **Configurer l'environnement** :
+   ```bash
+   python -m venv venv
+   source venv/bin/activate  # Linux/Mac
+   # OU
+   .\venv\Scripts\activate  # Windows
+   
+   pip install -r requirements.txt
+   ```
+
+3. **Configurer les variables d'environnement** :
+   ```bash
+   cp .env.example .env
+   # Éditez .env avec vos paramètres
+   ```
+
+4. **Initialiser la base de données** :
+   ```bash
+   python scripts/init_db.py
+   ```
+
+5. **Lancer le bot** :
+   ```bash
+   python main.py
+   ```
+
+## 📚 Documentation Complète
+
+Consultez la [documentation complète](docs/README.md) pour plus de détails sur :
+
+- [Guide d'installation](docs/getting_started/installation.md)
+- [Configuration de l'API Kraken](docs/getting_started/api_authentication.md)
+- [Guide des stratégies](docs/user_guide/strategies.md)
+- [Gestion des risques](docs/user_guide/risk_management.md)
+- [Développement de stratégies personnalisées](docs/developer_guide/creating_strategies.md)
+- [FAQ](docs/faq.md)
+
+## 🤝 Contribution
+
+Les contributions sont les bienvenues ! Consultez notre [guide de contribution](CONTRIBUTING.md) pour commencer.
+
+## 📄 Licence
+
+Ce projet est sous licence MIT. Voir le fichier [LICENSE](LICENSE) pour plus de détails.
+
+## 📞 Support
+
+Pour toute question ou problème, veuillez [ouvrir une issue](https://github.com/yourusername/Kraken_Bot/issues).
+
+## 📊 Aperçu
+
+### Interface en Ligne de Commande
+```
+====================================
+  KRAKEN BOT - TRADING TERMINAL
+====================================
+
+💰 Portefeuille: 10,000.00 EUR
+📈 Performance: +15.3% (30j)
+🔄 Trades actifs: 5/10
+
+[1] Démarrer le trading
+[2] Configurer les stratégies
+[3] Afficher le portefeuille
+[4] Voir les performances
+[5] Paramètres
+[6] Quitter
+
+Votre choix: 
+```
+
+### Statistiques de Performance
+```
+📊 PERFORMANCE GLOBALE
+-----------------------
+Capital initial: 10,000.00 EUR
+Capital actuel: 11,530.00 EUR
+Rendement total: +15.30%
+
+📈 MEILLEURS TRADES
+-------------------
+1. BTC/EUR: +24.5%
+2. ETH/EUR: +18.2%
+3. SOL/EUR: +12.7%
+
+📉 PIRE TRADES
+--------------
+1. XRP/EUR: -5.2%
+2. ADA/EUR: -3.1%
+3. DOGE/EUR: -1.8%
+```
+
+## 📅 Roadmap
+
+- [ ] Interface Web
+- [ ] Support pour d'autres exchanges
+- [ ] Stratégies avancées avec ML
+- [ ] Optimisation des performances
+- [ ] Backtesting distribué
+
+## 📞 Contact
+
+Pour toute question ou suggestion, n'hésitez pas à [nous contacter](mailto:contact@example.com).
 
 ---
 
