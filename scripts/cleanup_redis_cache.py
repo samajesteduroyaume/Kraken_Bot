@@ -5,7 +5,7 @@ import json
 from datetime import datetime, timedelta
 from typing import Dict, Any
 from src.cache.redis_cache import RedisCache
-from src.core.config import Config
+from src.core.config_adapter import Config  # Migré vers le nouvel adaptateur
 
 # Configuration du logging
 logging.basicConfig(
@@ -122,7 +122,7 @@ async def start_cache_cleanup(config: Config):
 
 if __name__ == "__main__":
     # Charger la configuration
-    config = Config()
+    config = Config
     
     # Configurer le logging
     logging.basicConfig(

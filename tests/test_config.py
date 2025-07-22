@@ -1,7 +1,7 @@
 import os
 import unittest
 from unittest.mock import patch
-from src.core.config import Config
+from src.core.config_adapter import Config  # Migré vers le nouvel adaptateur
 
 
 class TestConfig(unittest.TestCase):
@@ -20,7 +20,7 @@ class TestConfig(unittest.TestCase):
         os.environ['KRAKEN_API_SECRET'] = 'test_secret'
         os.environ['POSTGRES_PASSWORD'] = 'test_password'
         
-        config = Config()
+        config = Config
         self.assertEqual(config.api_config['api_key'], 'test_key')
         self.assertEqual(config.api_config['api_secret'], 'test_secret')
         self.assertEqual(config.db_config['password'], 'test_password')
@@ -31,7 +31,7 @@ class TestConfig(unittest.TestCase):
         os.environ['POSTGRES_PASSWORD'] = ''
         
         with self.assertRaises(ValueError):
-            config = Config()
+            config = Config
 
 if __name__ == '__main__':
     unittest.main()

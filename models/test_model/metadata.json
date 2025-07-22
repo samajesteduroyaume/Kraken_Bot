@@ -1,0 +1,59 @@
+{
+  "current_version": 56,
+  "versions": [
+    {
+      "version": 54,
+      "timestamp": "2025-07-21T15:47:49.311320",
+      "metrics": {
+        "train_accuracy": 1.0,
+        "test_accuracy": 0.98,
+        "precision": 0.9803921568627451,
+        "recall": 0.9803921568627451,
+        "f1_score": 0.9803921568627451,
+        "n_samples": 1000,
+        "n_features": 3,
+        "class_distribution": {
+          "class_0": 490,
+          "class_1": 510
+        }
+      },
+      "model_path": "models/test_model/model_v54.joblib"
+    },
+    {
+      "version": 55,
+      "timestamp": "2025-07-21T15:47:49.451928",
+      "metrics": {
+        "train_accuracy": 1.0,
+        "test_accuracy": 0.98,
+        "precision": 0.9803921568627451,
+        "recall": 0.9803921568627451,
+        "f1_score": 0.9803921568627451,
+        "n_samples": 1000,
+        "n_features": 3,
+        "class_distribution": {
+          "class_0": 490,
+          "class_1": 510
+        }
+      },
+      "model_path": "models/test_model/model_v55.joblib"
+    },
+    {
+      "version": 56,
+      "timestamp": "2025-07-21T15:47:49.591640",
+      "metrics": {
+        "train_accuracy": 1.0,
+        "test_accuracy": 0.98,
+        "precision": 0.9803921568627451,
+        "recall": 0.9803921568627451,
+        "f1_score": 0.9803921568627451,
+        "n_samples": 1000,
+        "n_features": 3,
+        "class_distribution": {
+          "class_0": 490,
+          "class_1": 510
+        }
+      },
+      "model_path": "models/test_model/model_v56.joblib"
+    }
+  ]
+}

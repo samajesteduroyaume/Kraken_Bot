@@ -4,6 +4,22 @@ from dotenv import load_dotenv
 import logging
 
 
+def load_env():
+    current = os.path.abspath(os.path.dirname(__file__))
+    while True:
+        env_path = os.path.join(current, '.env')
+        if os.path.exists(env_path):
+            load_dotenv(env_path, override=True)
+            break
+        parent = os.path.dirname(current)
+        if parent == current:
+            break
+        current = parent
+
+
+load_env()
+
+
 class Config:
     """Configuration du bot de trading."""
 
@@ -45,6 +61,17 @@ class Config:
             env_path = os.path.join(os.path.dirname(os.path.dirname(os.path.dirname(__file__))), '.env')
             load_dotenv(env_path)
             self.logger.info(f"Configuration chargée depuis: {env_path}. POSTGRES_USER={os.environ.get('POSTGRES_USER')}")
+
+            # Configuration reporting
+            self.reporting_config = {
+                'enabled': os.getenv('REPORTING_ENABLED', 'true').lower() == 'true',
+                'report_dir': os.getenv('REPORT_DIR', 'reports'),
+                'email_enabled': os.getenv('REPORTING_EMAIL_ENABLED', 'false').lower() == 'true',
+                'email_recipients': os.getenv('REPORTING_EMAIL_RECIPIENTS', '').split(','),
+                'daily_report': os.getenv('REPORTING_DAILY', 'true').lower() == 'true',
+                'weekly_report': os.getenv('REPORTING_WEEKLY', 'true').lower() == 'true',
+                'monthly_report': os.getenv('REPORTING_MONTHLY', 'true').lower() == 'true'
+            }
 
             # Configuration credentials
             self.credentials = {
@@ -168,7 +195,7 @@ class Config:
         Récupère une section de configuration.
 
         Args:
-            section: Section de configuration (api, trading, db, ml, log)
+            section: Section de configuration (api, trading, db, ml, log, reporting)
 
         Returns:
             Dictionnaire de configuration
@@ -184,6 +211,8 @@ class Config:
                 return self.ml_config
             elif section == 'log':
                 return self.log_config
+            elif section == 'reporting':
+                return self.reporting_config
             else:
                 raise ValueError(
                     f"Section de configuration invalide: {section}")

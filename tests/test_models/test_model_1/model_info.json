@@ -1,0 +1,20 @@
+{
+  "name": "test_model_1",
+  "model_type": "random_forest",
+  "accuracy": 0.55,
+  "train_accuracy": 0.8125,
+  "test_accuracy": 0.55,
+  "created_at": "2025-07-22T07:55:49.473247+00:00",
+  "features": [
+    "feature_0",
+    "feature_1",
+    "feature_2",
+    "feature_3",
+    "feature_4",
+    "feature_5",
+    "feature_6",
+    "feature_7",
+    "feature_8",
+    "feature_9"
+  ]
+}

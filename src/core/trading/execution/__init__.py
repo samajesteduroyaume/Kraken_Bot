@@ -17,7 +17,7 @@ from dataclasses import dataclass, field, asdict
 from datetime import datetime
 from enum import Enum, auto
 
-from src.core.config import Config
+from src.core.config_adapter import Config  # Migré vers le nouvel adaptateur
 from src.core.api.kraken import KrakenAPI
 from src.utils.helpers import generate_unique_id
 
@@ -141,7 +141,7 @@ class OrderExecutor:
             data_dir: Répertoire pour la sauvegarde des données (optionnel)
         """
         self.api = api
-        self.config = config or Config()
+        self.config = config or Config
         self.data_dir = data_dir or ensure_data_dir()
 
         # Suivi des états

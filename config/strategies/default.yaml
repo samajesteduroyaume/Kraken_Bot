@@ -1,0 +1,119 @@
+# Configuration par défaut des stratégies
+# Ce fichier peut être surchargé par un fichier de configuration spécifique à l'environnement
+
+# Paramètres globaux des stratégies
+global:
+  # Configuration des timeframes multiples
+  timeframes:
+    - interval: "15m"
+      weight: 0.2
+    - interval: "1h"
+      weight: 0.3
+    - interval: "4h"
+      weight: 0.5
+  
+  # Gestion des corrélations entre marchés
+  correlation:
+    enabled: true
+    threshold: 0.7  # Seuil de corrélation maximale autorisée
+    lookback: 30    # Nombre de jours pour le calcul des corrélations
+  
+  # Paramètres de gestion des risques
+  risk_management:
+    max_portfolio_risk: 0.02  # 2% de risque maximal par trade
+    max_drawdown: 0.1         # 10% de drawdown maximal autorisé
+    position_sizing: "volatility"  # Méthode de calcul de la taille de position
+    
+# Configuration des stratégies individuelles
+trend_following:
+  enabled: true
+  weight: 0.4
+  risk_multiplier: 1.0
+  symbols: ["BTC/USD", "ETH/USD", "XRP/USD"]
+  timeframe: "1h"
+  fast_ma: 10
+  slow_ma: 50
+  ma_type: "ema"
+
+mean_reversion:
+  enabled: true
+  weight: 0.3
+  risk_multiplier: 0.8
+  symbols: ["BTC/USD", "ETH/USD"]
+  timeframe: "15m"
+  lookback: 20
+  std_multiplier: 2.0
+  entry_threshold: 2.0
+  ma_type: "sma"
+
+momentum:
+  enabled: true
+  weight: 0.3
+  risk_multiplier: 1.2
+  symbols: ["BTC/USD", "ETH/USD", "LTC/USD", "XRP/USD"]
+  timeframe: "4h"
+  rsi_period: 14
+  rsi_overbought: 70.0
+  rsi_oversold: 30.0
+  macd_fast: 12
+  macd_slow: 26
+  macd_signal: 9
+  volatility_filter: 1.5
+
+grid_trading:
+  enabled: true
+  weight: 0.3
+  risk_multiplier: 1.0
+  symbols: ["BTC/USD", "ETH/USD"]
+  timeframe: "15m"
+  grid_levels: 5
+  grid_spacing_pct: 1.5
+  take_profit_pct: 1.0
+  stop_loss_pct: 3.0
+  position_size_pct: 10.0
+  max_drawdown_pct: 10.0
+
+# Configuration des stratégies multi-marchés
+multi_market:
+  enabled: true
+  weight: 0.4
+  risk_multiplier: 1.2
+  
+  # Groupes de marchés corrélés
+  market_groups:
+    - name: "majors"
+      symbols: ["BTC/USD", "ETH/USD"]
+      max_exposure: 0.5  # 50% du capital maximum pour ce groupe
+    - name: "altcoins"
+      symbols: ["XRP/USD", "LTC/USD", "ADA/USD"]
+      max_exposure: 0.3
+  
+  # Paramètres de diversification
+  diversification:
+    max_per_market: 0.2  # 20% max par marché
+    min_correlation: -0.3  # Corrélation minimale souhaitée
+
+# Configuration des stratégies multi-timeframes
+multi_timeframe:
+  enabled: true
+  weight: 0.3
+  risk_multiplier: 0.8
+  
+  # Définition des timeframes et de leur importance
+  timeframes:
+    - interval: "15m"
+      weight: 0.2
+      indicators: ["rsi", "bbands"]
+    - interval: "1h"
+      weight: 0.3
+      indicators: ["ema", "macd"]
+    - interval: "4h"
+      weight: 0.5
+      indicators: ["ichimoku", "atr"]
+  
+  # Règles de confirmation entre timeframes
+  confirmation_rules:
+    min_timeframes: 2  # Nombre minimum de timeframes devant confirmer le signal
+    priority: "higher"  # Priorité aux timeframes plus longs
+  volatility_lookback: 20
+  volatility_threshold: 0.5

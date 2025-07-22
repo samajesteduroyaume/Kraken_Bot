@@ -1,11 +1,47 @@
 """
-Classe de base pour les stratégies de trading.
+Classe de base pour les stratégies de trading avancées.
 """
 from abc import ABC, abstractmethod
-from typing import Dict, List
+from typing import Dict, List, Tuple, Optional, Union
 import pandas as pd
+import numpy as np
 import logging
+from datetime import datetime, timedelta, timezone
 from decimal import Decimal, ROUND_HALF_UP
+from enum import Enum, auto
+from dataclasses import dataclass
+from typing import List, Dict, Any, Optional
+from datetime import datetime
+
+class SignalStrength(Enum):
+    STRONG = 3
+    MODERATE = 2
+    WEAK = 1
+    NEUTRAL = 0
+    WEAK_SELL = -1
+    MODERATE_SELL = -2
+    STRONG_SELL = -3
+
+@dataclass
+class TradeSignal:
+    """Classe pour représenter un signal de trading."""
+    symbol: str
+    direction: int  # 1 pour achat, -1 pour vente
+    strength: SignalStrength
+    price: Decimal
+    stop_loss: Optional[Decimal] = None
+    take_profit: Optional[Decimal] = None
+    timestamp: datetime = datetime.now(timezone.utc)
+    metadata: Dict[str, Any] = None
+
+@dataclass
+class PositionSizing:
+    """Classe pour la gestion de la taille des positions."""
+    size: Decimal
+    risk_reward_ratio: Decimal
+    stop_loss_pct: Decimal
+    take_profit_pct: Decimal
+    max_position_size: Decimal
 
 logger = logging.getLogger(__name__)
 
@@ -27,26 +63,209 @@ class BaseStrategy(ABC):
 
     def __init__(self, config: dict = None):
         """
-        Initialise la stratégie de trading.
+        Initialise la stratégie de trading avancée.
 
         Args:
             config (dict, optional): Configuration de la stratégie. Par défaut None.
         """
         self.config = config or {}
         self.name = "BaseStrategy"
-        self.portfolio_value = self.config.get('portfolio_value', 100000.0)
-        self.risk_per_trade = self.config.get('risk_per_trade', 0.01)
-        self.max_position_size = self.config.get('max_position_size', 0.15)
-        self.timeframes = ['15m', '1h', '4h', '1d']
+        self.portfolio_value = Decimal(str(self.config.get('portfolio_value', 100000.0)))
+        self.risk_per_trade = Decimal(str(self.config.get('risk_per_trade', 0.01)))
+        self.max_position_size = Decimal(str(self.config.get('max_position_size', 0.15)))
+        self.timeframes = self.config.get('timeframes', ['15m', '1h', '4h', '1d'])
+        self.primary_timeframe = self.timeframes[0]
         self.last_update = None
-        self.is_real_time = self.config.get(
-            'real_time', True)  # Mode temps réel par défaut
-        self.last_real_time_update = datetime.datetime.now()
-        # Intervalle de mise à jour en temps réel
+        self.is_real_time = self.config.get('real_time', True)
+        self.last_real_time_update = datetime.now()
         self.real_time_interval = timedelta(seconds=10)
-
-        # Validation de la configuration
-        self.validate_config()
+        
+        # Configuration du risque avancé
+        self.volatility_adjusted_risk = self.config.get('volatility_adjusted_risk', True)
+        self.dynamic_position_sizing = self.config.get('dynamic_position_sizing', True)
+        self.max_drawdown = Decimal(str(self.config.get('max_drawdown', 0.10)))  # 10% max de drawdown
+        
+        # Configuration des indicateurs
+        self.indicators = {}
+        self.ml_model = None
+        self.meta_strategy_weights = {}
+        
+        # Suivi des performances
+        self.trade_history = []
+        self.performance_metrics = {}
+        self.equity_curve = []
+        self.max_equity = self.portfolio_value
+        self.max_drawdown = Decimal('0')
+        
+        # Validation de la configuration (uniquement si la méthode n'est pas surchargée)
+        if type(self).validate_config == BaseStrategy.validate_config:
+            self.validate_config()
+        
+    # ===== Méthodes de gestion du risque avancé =====
+    
+    def calculate_position_size(self, entry_price: Decimal, stop_loss: Decimal) -> PositionSizing:
+        """
+        Calcule la taille de position optimale en fonction du risque et de la volatilité.
+        
+        Args:
+            entry_price: Prix d'entrée proposé
+            stop_loss: Niveau de stop-loss proposé
+            
+        Returns:
+            PositionSizing: Détails de la taille de position calculée
+        """
+        if entry_price <= Decimal('0'):
+            raise ValueError("Le prix d'entrée doit être supérieur à zéro")
+            
+        # Calcul du risque en pourcentage du prix
+        risk_percent = (abs(entry_price - stop_loss) / entry_price).quantize(Decimal('0.0001'))
+        
+        if risk_percent <= Decimal('0'):
+            # Éviter la division par zéro
+            risk_percent = Decimal('0.01')  # 1% par défaut
+            
+        # Taille de position basée sur le risque
+        risk_amount = self.portfolio_value * self.risk_per_trade
+        position_value = (risk_amount / risk_percent).quantize(Decimal('0.01'))
+        
+        # Limiter à la taille de position maximale
+        max_position_value = self.portfolio_value * self.max_position_size
+        position_value = min(position_value, max_position_value)
+        
+        # Calcul du take-profit basé sur le ratio risque/rendement
+        risk_reward_ratio = Decimal(str(self.config.get('risk_reward_ratio', 2.0)))
+        take_profit_pct = risk_percent * risk_reward_ratio
+        
+        return PositionSizing(
+            size=position_value,
+            risk_reward_ratio=risk_reward_ratio,
+            stop_loss_pct=risk_percent,
+            take_profit_pct=take_profit_pct,
+            max_position_size=max_position_value
+        )
+    
+    def update_equity_curve(self, pnl: Decimal) -> None:
+        """
+        Met à jour la courbe d'équité et calcule les métriques de performance.
+        
+        Args:
+            pnl: Profit ou perte du dernier trade
+        """
+        self.portfolio_value += pnl
+        self.equity_curve.append({
+            'timestamp': datetime.utcnow(),
+            'equity': float(self.portfolio_value),
+            'pnl': float(pnl)
+        })
+        
+        # Mise à jour du drawdown
+        self.max_equity = max(self.max_equity, self.portfolio_value)
+        if self.max_equity > 0:
+            drawdown = (self.max_equity - self.portfolio_value) / self.max_equity
+            self.max_drawdown = max(self.max_drawdown, drawdown)
+    
+    # ===== Méthodes de génération de signaux =====
+    
+    @abstractmethod
+    def generate_signals(self, data: Dict[str, pd.DataFrame]) -> List[TradeSignal]:
+        """
+        Méthode abstraite pour générer des signaux de trading.
+        
+        Args:
+            data: Dictionnaire de DataFrames avec les données de marché par timeframe
+            
+        Returns:
+            Liste des signaux de trading générés
+        """
+        pass
+    
+    def combine_signals(self, signals: List[TradeSignal]) -> Optional[TradeSignal]:
+        """
+        Combine plusieurs signaux en un seul signal consolidé.
+        
+        Args:
+            signals: Liste des signaux à combiner
+            
+        Returns:
+            Signal consolidé ou None si aucun signal clair
+        """
+        if not signals:
+            return None
+            
+        # Compter les signaux par direction
+        buy_count = sum(1 for s in signals if s.direction > 0)
+        sell_count = sum(1 for s in signals if s.direction < 0)
+        neutral_count = len(signals) - buy_count - sell_count
+        
+        # Décider de la direction globale
+        if buy_count > sell_count and buy_count > neutral_count:
+            direction = 1
+            strength = max(s.strength.value for s in signals if s.direction > 0)
+        elif sell_count > buy_count and sell_count > neutral_count:
+            direction = -1
+            strength = min(s.strength.value for s in signals if s.direction < 0)
+        else:
+            return None
+            
+        # Créer un nouveau signal consolidé
+        avg_price = sum(float(s.price) for s in signals) / len(signals)
+        return TradeSignal(
+            symbol=signals[0].symbol,
+            direction=direction,
+            strength=SignalStrength(strength),
+            price=Decimal(str(avg_price))
+        )
+    
+    # ===== Méthodes d'intégration ML =====
+    
+    def set_ml_model(self, model) -> None:
+        """
+        Définit le modèle de machine learning à utiliser.
+        
+        Args:
+            model: Modèle de ML compatible avec scikit-learn (doit implémenter predict_proba)
+        """
+        self.ml_model = model
+        
+    def predict_with_ml(self, features: np.ndarray) -> np.ndarray:
+        """
+        Effectue une prédiction avec le modèle ML.
+        
+        Args:
+            features: Tableau de caractéristiques pour la prédiction
+            
+        Returns:
+            Prédictions du modèle
+        """
+        if self.ml_model is None:
+            raise ValueError("Aucun modèle ML n'a été défini")
+            
+        try:
+            return self.ml_model.predict_proba(features)
+        except Exception as e:
+            logger.error(f"Erreur lors de la prédiction ML: {e}")
+            raise
+    
+    # ===== Méthodes de métadonnées et de journalisation =====
+    
+    def to_dict(self) -> Dict[str, Any]:
+        """
+        Convertit la configuration de la stratégie en dictionnaire.
+        
+        Returns:
+            Dictionnaire de configuration
+        """
+        return {
+            'name': self.name,
+            'portfolio_value': float(self.portfolio_value),
+            'risk_per_trade': float(self.risk_per_trade),
+            'max_position_size': float(self.max_position_size),
+            'timeframes': self.timeframes,
+            'is_real_time': self.is_real_time,
+            'volatility_adjusted_risk': self.volatility_adjusted_risk,
+            'dynamic_position_sizing': self.dynamic_position_sizing,
+            'max_drawdown': float(self.max_drawdown)
+        }
 
     async def update_real_time(self, market_data: Dict[str, Dict]) -> None:
         """
@@ -94,22 +313,24 @@ class BaseStrategy(ABC):
 
     def validate_config(self):
         """
-        Valide la configuration de la stratégie.
+        Valide la configuration de la stratégie avancée.
         """
-        if not isinstance(self.risk_per_trade, (float, int)
-                          ) or not 0 < self.risk_per_trade <= 1:
-            raise ValueError(
-                "Le risque par trade doit être un nombre entre 0 et 1")
+        # Validation des paramètres de risque
+        if not (Decimal('0') < self.risk_per_trade <= Decimal('1')):
+            raise ValueError("Le risque par trade doit être un nombre entre 0 et 1")
 
-        if not isinstance(self.max_position_size, (float, int)
-                          ) or not 0 < self.max_position_size <= 1:
-            raise ValueError(
-                "La taille maximale de position doit être un nombre entre 0 et 1")
+        if not (Decimal('0') < self.max_position_size <= Decimal('1')):
+            raise ValueError("La taille maximale de position doit être un nombre entre 0 et 1")
 
-        if not isinstance(self.portfolio_value, (float, int)
-                          ) or self.portfolio_value <= 0:
-            raise ValueError(
-                "La valeur du portefeuille doit être un nombre positif")
+        if not self.timeframes:
+            raise ValueError("Au moins un timeframe doit être spécifié pour la stratégie")
+            
+        if not isinstance(self.timeframes, list) or not all(isinstance(tf, str) for tf in self.timeframes):
+            raise ValueError("Les timeframes doivent être une liste de chaînes de caractères")
+            
+        # Validation des paramètres de gestion du risque
+        if not (Decimal('0') <= self.max_drawdown < Decimal('1')):
+            raise ValueError("Le drawdown maximum doit être un nombre entre 0 et 1")
 
     def validate_data(self, data: Dict[str, pd.DataFrame]) -> bool:
         """

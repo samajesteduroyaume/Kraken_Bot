@@ -3,27 +3,15 @@ Package de configuration - Contient les fichiers de configuration du projet.
 """
 
 from .trading_pairs_config import (
-    TradingPairConfig,
-    CorrelationAnalyzer,
-    get_recommended_pairs,
-    filter_correlated_pairs,
-    get_pair_config,
-    MAJOR_PAIRS,
-    ALL_PAIR_SYMBOLS
+    get_trading_pairs,
+    get_all_trading_pairs,
+    initialize
 )
 
+# Les configurations de stratégie ont été déplacées dans src/core/config
+
 __all__ = [
-    'DB_CONFIG',
-    'KRAKEN_CONFIG',
-    'ML_CONFIG',
-    'LOG_CONFIG',
-    'TradingPairConfig',
-    'CorrelationAnalyzer',
-    'get_recommended_pairs',
-    'filter_correlated_pairs',
-    'get_pair_config',
-    'MAJOR_PAIRS',
-    'ALL_PAIR_SYMBOLS',
-    'ALTCOINS',
-    'DEFI_PAIRS'
+    'get_trading_pairs',
+    'get_all_trading_pairs',
+    'initialize'
 ]

@@ -4,7 +4,7 @@ import tarfile
 import datetime
 from pathlib import Path
 from typing import Dict, Any
-from src.core.config import Config
+from src.core.config_adapter import Config  # Migré vers le nouvel adaptateur
 import boto3
 from botocore.exceptions import NoCredentialsError
 
@@ -22,14 +22,15 @@ class LogBackup:
     def __init__(self, config: Config):
         """Initialise le système de backup."""
         self.config = config
+        log_config = config.get('log_config', {})
+        backup_config = config.get('backup_config', {})
+        
         self.log_dir = os.path.expanduser(
-            config.LOGGING.get(
-                'dir', '~/kraken_bot_logs'))
+            log_config.get('dir', '~/kraken_bot_logs'))
         self.backup_dir = os.path.expanduser(
-            config.BACKUP.get('dir', '~/kraken_bot_backups'))
-        self.backup_interval = config.BACKUP.get(
-            'interval', 'daily')  # daily, weekly, monthly
-        self.aws_config = config.AWS
+            backup_config.get('dir', '~/kraken_bot_backups'))
+        self.backup_interval = backup_config.get('interval', 'daily')  # daily, weekly, monthly
+        self.aws_config = config.get('aws_config', {})
 
         # Créer le répertoire de backup s'il n'existe pas
         Path(self.backup_dir).mkdir(parents=True, exist_ok=True)

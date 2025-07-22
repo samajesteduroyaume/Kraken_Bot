@@ -4,7 +4,7 @@ import yaml
 import logging
 from pathlib import Path
 from typing import Dict, Any
-from src.core.config import Config
+from src.core.config_adapter import Config  # Migré vers le nouvel adaptateur
 
 # Configuration du logging
 logging.basicConfig(
@@ -115,7 +115,7 @@ class ConfigValidator:
         
         # Vérifier la connexion à la base de données
         try:
-            config = Config()
+            config = Config
             if not self.check_database_connection(config):
                 valid = False
         except Exception as e:

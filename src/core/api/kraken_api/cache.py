@@ -43,19 +43,21 @@ class KrakenCache:
         self.logger.debug(f"Cache hit for key: {key}")
         return entry['value']
 
-    def set(self, key: str, value: Dict[str, Any]) -> None:
+    def set(self, key: str, value: Dict[str, Any], ttl: Optional[int] = None) -> None:
         """
         Stocke une valeur dans le cache.
 
         Args:
             key: Clé du cache
             value: Valeur à stocker
+            ttl: Durée de vie en secondes (optionnel, utilise self.ttl par défaut)
         """
+        ttl = ttl if ttl is not None else self.ttl
         self.cache[key] = {
             'value': value,
-            'expires': datetime.now() + timedelta(seconds=self.ttl)
+            'expires': datetime.now() + timedelta(seconds=ttl)
         }
-        self.logger.debug(f"Cache stored for key: {key}")
+        self.logger.debug(f"Cache stored for key: {key} (TTL: {ttl}s)")
 
     def clear(self) -> None:
         """Supprime toutes les entrées du cache."""

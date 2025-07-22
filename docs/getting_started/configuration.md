@@ -1,53 +1,186 @@
-# ⚙️ Configuration
+# ⚙️ Guide de Configuration
 
-Ce guide explique comment configurer Kraken_Bot pour répondre à vos besoins spécifiques de trading.
+Ce guide détaille comment configurer Kraken_Bot pour répondre précisément à vos besoins de trading. Une configuration correcte est essentielle pour des performances optimales et une expérience de trading fluide.
 
-## Fichiers de configuration principaux
+## 📁 Structure des Fichiers de Configuration
 
-Kraken_Bot utilise plusieurs fichiers de configuration :
+Kraken_Bot utilise une structure de configuration hiérarchique :
 
-1. **`.env`** - Variables d'environnement sensibles
+1. **`.env`** - Variables d'environnement sensibles (ne jamais versionner)
 2. **`config/config.yaml`** - Configuration principale de l'application
-3. **`config/strategies/`** - Dossier contenant les configurations des stratégies
+3. **`config/strategies/`** - Configurations spécifiques aux stratégies
+4. **`config/indicators/`** - Paramètres des indicateurs techniques
+5. **`config/risk/`** - Paramètres de gestion des risques
 
-## Configuration de base
+## 🔐 Configuration de Base (.env)
 
-### 1. Fichier .env
+Le fichier `.env` contient des informations sensibles. Il est automatiquement ignoré par Git.
 
-Le fichier `.env` contient des informations sensibles. Ne le partagez jamais et ne le versionnez pas (il est déjà dans `.gitignore`).
+### Configuration Requise
 
 ```env
-# Configuration de la base de données
-POSTGRES_USER=postgres
-POSTGRES_PASSWORD=votre_mot_de_passe
-POSTGRES_DB=kraken_bot
-POSTGRES_HOST=localhost
-POSTGRES_PORT=5432
-
-# Configuration de l'API Kraken
+# === Configuration de l'API Kraken ===
+# Format recommandé : API-KEY-... pour les nouvelles clés
 KRAKEN_API_KEY=votre_cle_api
 KRAKEN_SECRET=votre_cle_secrete
 
-# Configuration Redis
+# === Base de données (PostgreSQL recommandé) ===
+DB_ENGINE=django.db.backends.postgresql
+DB_NAME=kraken_bot
+DB_USER=postgres
+DB_PASSWORD=votre_mot_de_passe
+DB_HOST=localhost
+DB_PORT=5432
+
+# === Redis (Cache et files d'attente) ===
 REDIS_HOST=localhost
 REDIS_PORT=6379
-
-# Paramètres de trading (optionnels)
-TRADING_ENABLED=false  # Mettre à true pour activer le trading réel
-DRY_RUN=true          # Mode simulation activé par défaut
+REDIS_DB=0
+REDIS_PASSWORD=
 ```
 
-### 2. Fichier config.yaml
+### Configuration Optionnelle
 
-Le fichier principal de configuration se trouve dans `config/config.yaml` :
+```env
+# === Paramètres de l'application ===
+DEBUG=True
+SECRET_KEY=générer_une_clé_secrète_sécurisée
+ALLOWED_HOSTS=localhost,127.0.0.1
+
+# === Paramètres de Trading ===
+TRADING_ENABLED=false  # Activer le trading réel
+DRY_RUN=true          # Mode simulation activé
+MAX_TRADE_AMOUNT=1000  # Montant maximum par trade (USDT)
+MAX_RISK_PERCENT=2     # % maximum du capital à risquer
+
+# === Paramètres de Journalisation ===
+LOG_LEVEL=INFO
+LOG_FILE=logs/kraken_bot.log
+LOG_MAX_SIZE=10  # Taille max en Mo
+LOG_BACKUP_COUNT=5  # Nombre de fichiers de log à conserver
+```
+
+## ⚙️ Configuration Principale (config.yaml)
+
+Le fichier `config/config.yaml` contient la configuration détaillée de l'application.
+
+### Section Générale
 
 ```yaml
-# Configuration générale
 general:
-  environment: development  # ou 'production'
-  log_level: INFO
+  environment: development  # development, staging, production
+  log_level: INFO  # DEBUG, INFO, WARNING, ERROR, CRITICAL
   timezone: Europe/Paris
+  default_currency: USDT
+  data_dir: data/
+  cache_ttl: 300  # Durée de vie du cache en secondes
+```
 
+### Configuration de l'API
+
+```yaml
+api:
+  base_url: https://api.kraken.com
+  version: 0
+  public_endpoint: /public
+  private_endpoint: /private
+  rate_limit_per_second: 1  # Limite de requêtes par seconde
+  max_retries: 3
+  retry_delay: 1  # Délai entre les tentatives en secondes
+```
+
+### Configuration des Paires de Trading
+
+```yaml
+trading_pairs:
+  enabled:
+    - BTC/USDT
+    - ETH/USDT
+    - SOL/USDT
+  quote_currencies:
+    - USDT
+    - USD
+    - EUR
+  blacklist:
+    - XRP/USDT  # Paires à exclure
+```
+
+### Configuration des Stratégies
+
+```yaml
+strategies:
+  default: mean_reversion  # Stratégie par défaut
+  enabled:
+    mean_reversion:
+      enabled: true
+      risk_per_trade: 1.0  # % du capital à risquer
+      take_profit: 2.5     # % de profit cible
+      stop_loss: 1.0       # % de perte maximale
+    momentum:
+      enabled: true
+      rsi_period: 14
+      rsi_overbought: 70
+      rsi_oversold: 30
+```
+
+## 🔧 Configuration Avancée
+
+### Gestion des Risques
+
+```yaml
+risk_management:
+  max_portfolio_risk: 10.0  # % maximum du portefeuille à risquer
+  daily_loss_limit: 5.0     # % de perte quotidienne maximale
+  position_sizing: kelly    # Méthode de calcul de la taille de position
+  max_leverage: 5.0         # Effet de levier maximum
+  stop_loss:
+    type: trailing         # trailing, fixed, atr
+    default: 2.0           # % par défaut
+    atr_multiplier: 2.0    # Multiplicateur ATR pour le stop dynamique
+```
+
+### Configuration des Indicateurs Techniques
+
+```yaml
+technical_indicators:
+  rsi:
+    period: 14
+    overbought: 70
+    oversold: 30
+  macd:
+    fast_period: 12
+    slow_period: 26
+    signal_period: 9
+  bollinger_bands:
+    period: 20
+    std_dev: 2.0
+```
+
+## 🔄 Synchronisation de la Configuration
+
+Après avoir modifié la configuration, redémarrez le service :
+
+```bash
+docker-compose restart
+# Ou, pour une installation manuelle
+python manage.py check_config
+```
+
+## 🔍 Validation de la Configuration
+
+Vérifiez que votre configuration est valide avec :
+
+```bash
+python manage.py validate_config
+```
+
+## 🔒 Bonnes Pratiques de Sécurité
+
+1. **Ne jamais** versionner le fichier `.env`
+2. Utiliser des permissions restrictives : `chmod 600 .env`
+3. Régénérer régulièrement les clés API
+4. Utiliser des mots de passe forts et uniques
+5. Activer l'authentification à deux facteurs sur votre compte Kraken
 # Paramètres de trading
 trading:
   base_currency: EUR

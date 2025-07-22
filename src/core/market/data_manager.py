@@ -1,7 +1,8 @@
 import logging
 from typing import Dict, List, Optional, Any, AsyncIterator
 from datetime import datetime, timedelta
-from ..types.market_data import MarketData, Candle, OrderBook, Trade
+from ..types.market_types import MarketData, Candle, OrderBook as OrderBookType, Trade
+from .order_book import OrderBookManager, OrderBookSnapshot
 from ..analysis.technical import TechnicalAnalyzer
 import asyncio
 
@@ -34,8 +35,9 @@ class MarketDataManager:
         # Stockage des données
         self.market_data: Dict[str, MarketData] = {}
         self.candle_history: Dict[str, List[Candle]] = {}
-        self.order_book: Dict[str, OrderBook] = {}
+        self.order_books: Dict[str, OrderBookManager] = {}
         self.trades: Dict[str, List[Trade]] = {}
+        self._order_book_update_tasks: Dict[str, asyncio.Task] = {}
 
         # Analyse technique
         self.technical_analyzer = TechnicalAnalyzer()
@@ -100,16 +102,54 @@ class MarketDataManager:
                 f"Erreur lors de la récupération des bougies {symbol}: {e}")
             return []
 
-    async def _fetch_order_book(self, symbol: str) -> OrderBook:
-        """Récupère le carnet d'ordres de la paire."""
+    async def _fetch_order_book(self, symbol: str) -> Dict[str, Any]:
+        """
+        Récupère le carnet d'ordres de la paire.
+        
+        Args:
+            symbol: Symbole de la paire
+            
+        Returns:
+            Dictionnaire contenant les offres (asks), les demandes (bids) et le timestamp
+        """
         try:
-            # Récupérer le carnet d'ordres via l'API
-            order_book = await self.api.get_order_book(
-                pair=symbol,
-                depth=self.config.get('order_book_depth', 50)
-            )
-
-            return order_book
+            # Initialiser le gestionnaire de carnet d'ordres si nécessaire
+            if symbol not in self.order_books:
+                self.order_books[symbol] = OrderBookManager(symbol, self.api)
+                
+                # Démarrer la mise à jour automatique si ce n'est pas déjà fait
+                if symbol not in self._order_book_update_tasks:
+                    self._order_book_update_tasks[symbol] = asyncio.create_task(
+                        self.order_books[symbol].start(
+                            update_interval=self.config.get('orderbook_update_interval', 1.0)
+                        )
+                    )
+            
+            # Récupérer le gestionnaire de carnet d'ordres
+            order_book_manager = self.order_books[symbol]
+            
+            # S'assurer que le carnet est à jour
+            await order_book_manager.update()
+            
+            # Récupérer le snapshot actuel
+            snapshot = order_book_manager.current_snapshot
+            if snapshot is None:
+                raise ValueError("Impossible de récupérer le carnet d'ordres")
+                
+            # Convertir les données en format compatible avec l'ancienne interface
+            return {
+                'asks': [{'price': float(level['price']), 'amount': float(level['amount'])} 
+                        for level in snapshot.asks],
+                'bids': [{'price': float(level['price']), 'amount': float(level['amount'])} 
+                        for level in snapshot.bids],
+                'timestamp': snapshot.timestamp,
+                'metrics': {
+                    'spread': float(snapshot.metrics.spread) if snapshot.metrics.spread else None,
+                    'imbalance': float(snapshot.metrics.imbalance) if hasattr(snapshot.metrics, 'imbalance') else None,
+                    'vwap_bid': float(snapshot.metrics.vwap_bid) if hasattr(snapshot.metrics, 'vwap_bid') else None,
+                    'vwap_ask': float(snapshot.metrics.vwap_ask) if hasattr(snapshot.metrics, 'vwap_ask') else None
+                }
+            }
 
         except Exception as e:
             self.logger.error(
@@ -138,7 +178,7 @@ class MarketDataManager:
 
     def _analyze_market(self,
                         candles: List[Candle],
-                        order_book: OrderBook,
+                        order_book: OrderBookType,
                         trades: List[Trade]) -> Dict[str, Any]:
         """
         Analyse les données de marché.
@@ -169,23 +209,47 @@ class MarketDataManager:
 
         return analysis
 
-    def _analyze_order_book(self, order_book: OrderBook) -> Dict[str, Any]:
+    def _analyze_order_book(self, order_book: OrderBookType) -> Dict[str, Any]:
         """Analyse le carnet d'ordres."""
-        asks = order_book['asks']
-        bids = order_book['bids']
-
-        # Calcul des statistiques
-        ask_total = sum(float(level['amount']) for level in asks)
-        bid_total = sum(float(level['amount']) for level in bids)
-
-        # Calcul du spread
-        spread = float(asks[0]['price']) - float(bids[0]['price'])
-
+        if not order_book['asks'] or not order_book['bids']:
+            return {
+                'order_book_imbalance': 0.0,
+                'spread': 0.0,
+                'best_ask': 0.0,
+                'best_bid': 0.0,
+                'vwap_ask': 0.0,
+                'vwap_bid': 0.0,
+                'liquidity_imbalance': 0.0,
+                'order_imbalance': 0.0
+            }
+            
+        # Créer un snapshot pour l'analyse
+        snapshot = OrderBookSnapshot(
+            bids=order_book['bids'],
+            asks=order_book['asks'],
+            timestamp=order_book.get('timestamp', datetime.now())
+        )
+        
+        # Récupérer les métriques
+        metrics = snapshot.metrics
+        
+        # Calculer le déséquilibre de liquidité
+        liquidity_imbalance = 0.0
+        if metrics.vwap_ask and metrics.vwap_bid and metrics.mid_price:
+            spread = metrics.vwap_ask - metrics.vwap_bid
+            if spread > 0:
+                liquidity_imbalance = (metrics.mid_price - (metrics.vwap_bid + spread/2)) / (spread/2)
+        
         return {
-            'order_book_imbalance': (ask_total - bid_total) / (ask_total + bid_total),
-            'spread': spread,
-            'best_ask': float(asks[0]['price']),
-            'best_bid': float(bids[0]['price'])
+            'order_book_imbalance': float(metrics.imbalance) if metrics.imbalance else 0.0,
+            'spread': float(metrics.spread) if metrics.spread else 0.0,
+            'best_ask': float(metrics.best_ask) if metrics.best_ask else 0.0,
+            'best_bid': float(metrics.best_bid) if metrics.best_bid else 0.0,
+            'mid_price': float(metrics.mid_price) if metrics.mid_price else 0.0,
+            'vwap_ask': float(metrics.vwap_ask) if metrics.vwap_ask else 0.0,
+            'vwap_bid': float(metrics.vwap_bid) if metrics.vwap_bid else 0.0,
+            'liquidity_imbalance': liquidity_imbalance,
+            'order_imbalance': snapshot.metrics.order_imbalance if hasattr(snapshot.metrics, 'order_imbalance') else 0.0
         }
 
     def _analyze_trades(self, trades: List[Trade]) -> Dict[str, Any]:
@@ -207,9 +271,9 @@ class MarketDataManager:
             'buy_volume': buy_volume,
             'sell_volume': sell_volume,
             'buy_sell_ratio': buy_sell_ratio,
-            'last_price': float(trades[-1]['price'])
+            'last_price': float(trades[-1]['price']) if trades else 0.0
         }
-
+        
     def _update_history(self, symbol: str, candles: List[Candle]) -> None:
         """Met à jour l'historique des bougies."""
         if symbol not in self.candle_history:
@@ -233,9 +297,73 @@ class MarketDataManager:
         """Récupère l'historique des bougies pour une paire."""
         return self.candle_history.get(symbol, [])
 
-    def get_order_book(self, symbol: str) -> Optional[OrderBook]:
-        """Récupère le carnet d'ordres pour une paire."""
-        return self.order_book.get(symbol)
+    def get_order_book(self, symbol: str) -> Optional[OrderBookType]:
+        """
+        Récupère le carnet d'ordres actuel pour une paire.
+
+        Args:
+            symbol: Symbole de la paire
+
+        Returns:
+            Le carnet d'ordres ou None si non disponible
+        """
+        if symbol not in self.order_books:
+            return None
+            
+        snapshot = self.order_books[symbol].current_snapshot
+        if not snapshot:
+            return None
+            
+        return {
+            'asks': snapshot.asks,
+            'bids': snapshot.bids,
+            'timestamp': snapshot.timestamp
+        }
+        
+    def get_order_book_manager(self, symbol: str) -> Optional[OrderBookManager]:
+        """
+        Récupère le gestionnaire de carnet d'ordres pour une paire.
+        
+        Args:
+            symbol: Symbole de la paire
+            
+        Returns:
+            L'instance OrderBookManager ou None si non disponible
+        """
+        return self.order_books.get(symbol)
+        
+    async def stop_order_book_updates(self, symbol: str = None) -> None:
+        """
+        Arrête les mises à jour automatiques du carnet d'ordres.
+        
+        Args:
+            symbol: Symbole de la paire (si None, arrête toutes les mises à jour)
+        """
+        if symbol is not None:
+            if symbol in self._order_book_update_tasks:
+                task = self._order_book_update_tasks.pop(symbol)
+                task.cancel()
+                try:
+                    await task
+                except asyncio.CancelledError:
+                    pass
+                
+            if symbol in self.order_books:
+                await self.order_books[symbol].stop()
+        else:
+            # Arrêter toutes les mises à jour
+            tasks = list(self._order_book_update_tasks.values())
+            self._order_book_update_tasks.clear()
+            
+            for task in tasks:
+                task.cancel()
+                try:
+                    await task
+                except asyncio.CancelledError:
+                    pass
+                    
+            for ob in self.order_books.values():
+                await ob.stop()
 
     def get_trades(self, symbol: str) -> List[Trade]:
         """Récupère les trades pour une paire."""
@@ -267,3 +395,38 @@ class MarketDataManager:
             except Exception as e:
                 self.logger.error(f"Erreur dans le stream des données: {e}")
                 await asyncio.sleep(10)  # Attendre avant de réessayer
+                
+    async def close(self):
+        """
+        Ferme le gestionnaire et libère les ressources.
+        
+        Cette méthode doit être appelée à l'arrêt de l'application pour éviter les fuites de mémoire.
+        """
+        try:
+            # Arrêter toutes les mises à jour du carnet d'ordres
+            await self.stop_order_book_updates()
+            
+            # Nettoyer les autres ressources
+            self.market_data.clear()
+            self.candle_history.clear()
+            self.trades.clear()
+            
+            # Nettoyer les gestionnaires de carnet d'ordres
+            for ob in list(self.order_books.values()):
+                await ob.stop()
+            self.order_books.clear()
+            
+            # Annuler toutes les tâches en attente
+            for task in list(self._order_book_update_tasks.values()):
+                task.cancel()
+                try:
+                    await task
+                except asyncio.CancelledError:
+                    pass
+            self._order_book_update_tasks.clear()
+            
+            self.logger.info("Gestionnaire de données de marché arrêté avec succès")
+            
+        except Exception as e:
+            self.logger.error(f"Erreur lors de la fermeture du gestionnaire de données: {e}")
+            raise

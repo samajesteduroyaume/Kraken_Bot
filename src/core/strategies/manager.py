@@ -1,11 +1,13 @@
 import logging
-from typing import Dict, List
+from typing import Dict, List, Optional, Tuple
 from datetime import datetime
+import pandas as pd
 from src.core.types.market_data import MarketData
 from src.core.types import TradeSignal
-from src.core.types.trading import StrategyConfig
+from src.core.config.strategy_config import BaseStrategyConfig as StrategyConfig
 from src.core.analysis.predictor import MLPredictor
 from src.core.signals.generator import SignalGenerator
+from .strategy_switcher import StrategySwitcher, MarketCondition
 
 
 class StrategyManager:
@@ -74,8 +76,16 @@ class StrategyManager:
             }
         }
 
+        # Initialiser le système de switching de stratégies
+        self.strategy_switcher = StrategySwitcher(
+            config=config.get('strategy_switcher', {})
+        )
+        
         # Performance des stratégies
         self.strategy_performance: Dict[str, Dict] = {}
+        
+        # Dernières stratégies actives
+        self.last_active_strategies: List[str] = []
 
     def generate_signals(self, market_data: MarketData) -> List[TradeSignal]:
         """
@@ -90,12 +100,28 @@ class StrategyManager:
         try:
             # Initialiser la liste des signaux
             signals = []
-
+            
+            # Mettre à jour les poids des stratégies en fonction des conditions du marché
+            self.strategy_switcher.adjust_strategy_weights(market_data)
+            
+            # Obtenir les stratégies actives (soit configurées, soit sélectionnées par le système)
+            if self.config.get('enable_strategy_switching', False):
+                # Utiliser le système de switching pour sélectionner les meilleures stratégies
+                best_strategies = self.strategy_switcher.get_best_strategies(
+                    market_data,
+                    top_n=self.config.get('max_active_strategies', 3)
+                )
+                active_strategies = [s[0] for s in best_strategies]
+                self.last_active_strategies = active_strategies
+            else:
+                # Utiliser les stratégies configurées manuellement
+                active_strategies = self.config.get('active_strategies', [])
+            
             # Obtenir les indicateurs techniques
             indicators = market_data.get('analysis', {})
-
-            # Appliquer les stratégies configurées
-            for strategy_name in self.config.get('active_strategies', []):
+            
+            # Appliquer les stratégies actives
+            for strategy_name in active_strategies:
                 if strategy_name in self.strategies:
                     strategy_signals = self.strategies[strategy_name](
                         market_data,
@@ -105,10 +131,14 @@ class StrategyManager:
                     if strategy_signals:
                         signals.extend(strategy_signals)
 
-            # Générer les signaux ML
+            # Générer les signaux ML (toujours actif)
             ml_signals = self._generate_ml_signals(market_data)
             if ml_signals:
                 signals.extend(ml_signals)
+                
+            # Mettre à jour les poids des stratégies si nécessaire
+            if signals and self.config.get('enable_strategy_switching', False):
+                self._update_strategy_weights_based_on_signals(signals)
 
             # Filtrer et combiner les signaux
             return self._filter_and_combine_signals(signals)
@@ -350,6 +380,47 @@ class StrategyManager:
                 f"Erreur lors de la génération des signaux ML: {e}")
             return []
 
+    def _update_strategy_weights_based_on_signals(self, signals: List[TradeSignal]):
+        """
+        Met à jour les poids des stratégies en fonction des signaux générés.
+        
+        Args:
+            signals: Liste des signaux générés
+        """
+        if not signals:
+            return
+            
+        # Calculer le PnL total pour chaque stratégie
+        strategy_pnl = {}
+        
+        for signal in signals:
+            strategy_name = signal.get('strategy', 'unknown')
+            pnl = signal.get('pnl', 0)
+            
+            if strategy_name not in strategy_pnl:
+                strategy_pnl[strategy_name] = {
+                    'total_pnl': 0,
+                    'count': 0
+                }
+                
+            strategy_pnl[strategy_name]['total_pnl'] += pnl
+            strategy_pnl[strategy_name]['count'] += 1
+        
+        # Mettre à jour les performances des stratégies
+        for strategy_name, data in strategy_pnl.items():
+            if data['count'] > 0:
+                avg_pnl = data['total_pnl'] / data['count']
+                self.strategy_switcher.update_strategy_performance(
+                    strategy_name,
+                    {
+                        'pnl': avg_pnl,
+                        'timestamp': datetime.now()
+                    }
+                )
+                
+        # Ajuster les poids des stratégies
+        self.strategy_switcher.adjust_strategy_weights(None)
+
     def _filter_and_combine_signals(
             self, signals: List[TradeSignal]) -> List[TradeSignal]:
         """
@@ -361,39 +432,36 @@ class StrategyManager:
         Returns:
             Liste des signaux filtrés et combinés
         """
+        if not signals:
+            return []
+            
         try:
-            # Regrouper par symbole et action
-            grouped_signals = {}
+            # Grouper les signaux par symbole et action
+            signals_by_symbol = {}
             for signal in signals:
                 key = (signal['symbol'], signal['action'])
-                if key not in grouped_signals:
-                    grouped_signals[key] = []
-                grouped_signals[key].append(signal)
-
-            # Consolider les signaux
-            consolidated_signals = []
-            for (symbol, action), sig_list in grouped_signals.items():
-                # Calculer la confiance moyenne
-                avg_confidence = sum(s['confidence']
-                                     for s in sig_list) / len(sig_list)
-
-                # Combiner les raisons
-                reasons = set(s['reason'] for s in sig_list)
-
-                # Créer le signal consolidé
-                consolidated_signals.append({
-                    'symbol': symbol,
-                    'action': action,
-                    'price': sig_list[0]['price'],
-                    'confidence': avg_confidence,
-                    'reason': ', '.join(reasons),
-                    'timestamp': datetime.now(),
-                    'indicators': {k: v for s in sig_list for k, v in s.items()
-                                   if k not in ['symbol', 'action', 'price', 'confidence', 'reason', 'timestamp']}
-                })
-
-            return consolidated_signals
-
+                if key not in signals_by_symbol:
+                    signals_by_symbol[key] = []
+                signals_by_symbol[key].append(signal)
+            
+            # Combiner les signaux pour chaque paire/action
+            combined_signals = []
+            for (symbol, action), signal_group in signals_by_symbol.items():
+                # Trier par confiance décroissante
+                signal_group.sort(key=lambda x: x.get('confidence', 0), reverse=True)
+                
+                # Prendre le signal le plus fort
+                combined_signal = signal_group[0].copy()
+                
+                # Si plusieurs signaux, combiner les raisons
+                if len(signal_group) > 1:
+                    reasons = set(s.get('reason', '') for s in signal_group)
+                    combined_signal['reason'] = ', '.join(reasons)
+                
+                combined_signals.append(combined_signal)
+            
+            return combined_signals
+            
         except Exception as e:
             self.logger.error(f"Erreur lors du filtrage des signaux: {e}")
             return []

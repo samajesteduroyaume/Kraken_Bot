@@ -5,7 +5,7 @@ except ImportError:
     raise ImportError(
         "Le module 'redis' n'est pas installé. Installez-le avec 'pip install redis'.")
 from typing import Any, Optional, Dict, List
-from src.core.config import Config
+from src.core.config_adapter import Config  # Migré vers le nouvel adaptateur
 import json
 
 # Configuration du logging

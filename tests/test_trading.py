@@ -11,13 +11,13 @@ from src.core.portfolio import PortfolioManager
 from src.core.order_execution import OrderExecutor
 from src.core.risk_management import RiskManager
 from src.core.position import Position
-from src.core.config import Config
+from src.core.config_adapter import Config  # Migré vers le nouvel adaptateur
 
 class TestTradingComponents(unittest.IsolatedAsyncioTestCase):
     @classmethod
     def setUpClass(cls):
         # Configuration de base pour les tests
-        cls.config = Config()
+        cls.config = Config
         
         # Configuration de trading pour les tests
         os.environ['RISK_PER_TRADE'] = '0.01'  # 1% du portefeuille
@@ -159,7 +159,7 @@ class TestTradingComponents(unittest.IsolatedAsyncioTestCase):
 
     async def test_market_data(self):
         # Test de la récupération des données de marché
-        api = KrakenAPI(config=self.config)
+        api = KrakenAPI(api_key='test_key', api_secret='test_secret')
         
         # Mock de la réponse de l'API
         with patch('src.core.api.kraken.KrakenAPI.get_ohlc_data') as mock_get_ohlc:

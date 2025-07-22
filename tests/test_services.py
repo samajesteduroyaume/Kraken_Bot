@@ -16,7 +16,7 @@ from src.monitoring.redis_monitor import RedisMonitor
 from src.backup.log_backup import LogBackup
 from src.reporting.trading_reporter import TradingReporter
 from src.trading.redis_trading import RedisTradingManager
-from src.core.config import Config
+from src.core.config_adapter import Config  # Migré vers le nouvel adaptateur
 
 # Configuration du logging
 logging.basicConfig(
@@ -89,7 +89,7 @@ class TestServices(unittest.TestCase):
         os.environ['SIMULATION_BALANCE_EUR'] = '1000.0'
         
         # Créer l'objet Config
-        cls.config = Config()
+        cls.config = Config
         
         # Initialiser les services
         cls.redis = RedisCache(cls.config)

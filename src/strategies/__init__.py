@@ -1,18 +1,18 @@
 """
 Package contenant les différentes stratégies de trading pour le bot Kraken.
+
+Ce package a été réorganisé avec une architecture plus modulaire :
+- core/ : Contient les implémentations des stratégies principales
+- indicators/ : Contient les indicateurs techniques réutilisables
+- config/ : Contient les configurations des stratégies
 """
 from .base_strategy import BaseStrategy
-from .momentum_strategy import MomentumStrategy
-from .mean_reversion_strategy import MeanReversionStrategy
-from .breakout_strategy import BreakoutStrategy
-from .grid_strategy import GridStrategy
-from .swing_strategy import SwingStrategy
+from .core import TrendFollowingStrategy, MeanReversionStrategy
+from .config import get_config
 
 __all__ = [
     'BaseStrategy',
-    'MomentumStrategy',
+    'TrendFollowingStrategy',
     'MeanReversionStrategy',
-    'BreakoutStrategy',
-    'GridStrategy',
-    'SwingStrategy'
+    'get_config'
 ]

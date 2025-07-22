@@ -1,0 +1,71 @@
+# Configuration de test pour les tests unitaires
+
+# Configuration de l'API (valeurs factices pour les tests)
+api:
+  api_key: "${KRAKEN_API_KEY}"  # Remplacé par la variable d'environnement
+  api_secret: "${KRAKEN_API_SECRET}"  # Remplacé par la variable d'environnement
+  enable_rate_limit: false  # Désactiver la limitation de débit pour les tests
+  timeout: 10000  # ms
+
+# Configuration générale du trading
+trading:
+  # Paires de trading pour les tests
+  pairs:
+    - XBT/USD
+    - ETH/USD
+    - XRP/USD
+  
+  # Paramètres généraux
+  min_score: 0.3
+  min_volume: 1000000
+  max_positions: 2
+  max_holding_time: 86400
+  max_concurrent_requests: 1
+  analysis_timeout: 60.0
+  max_pairs_to_analyze: 10
+  
+  # Filtres d'actifs
+  exclude_illiquid: true
+  min_daily_trades: 200
+  min_market_cap: 100000000
+  exclude_stablecoins: true
+  exclude_leveraged: true
+
+# Configuration de la base de données (valeurs factices pour les tests)
+database:
+  enabled: true
+  user: "${POSTGRES_USER}"
+  password: "${POSTGRES_PASSWORD}"
+  host: "${POSTGRES_HOST}"
+  port: ${POSTGRES_PORT}
+  database: "${POSTGRES_DB}"
+  pool_size: 5
+  max_overflow: 10
+  pool_timeout: 30
+  pool_recycle: 3600
+  echo: false
+
+# Configuration de Redis pour les tests
+redis:
+  enabled: true
+  host: "${REDIS_HOST}"
+  port: ${REDIS_PORT}
+  db: 1  # DB différente pour les tests
+  password: ""
+  socket_timeout: 5.0
+  socket_connect_timeout: 5.0
+  socket_keepalive: true
+  retry_on_timeout: true
+  max_connections: 10
+  health_check_interval: 30
+
+# Configuration des logs pour les tests
+log:
+  level: "WARNING"  # Moins de logs pendant les tests
+  log_dir: "tests/logs"
+  max_bytes: 1048576  # 1MB
+  backup_count: 1
+  console: false
+  file: false
+  format: "%(asctime)s - %(name)s - %(levelname)s - %(message)s"
+  date_format: "%Y-%m-%d %H:%M:%S"

@@ -2,7 +2,7 @@ import logging
 from typing import Dict, List, Optional
 from datetime import datetime
 from datetime import timedelta
-from ..types.market_data import MarketData
+from ..types.market_types import MarketData
 from ..types.types import TradeSignal, Position
 from ..types.trading import TradingMetrics
 

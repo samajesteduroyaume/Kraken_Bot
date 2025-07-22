@@ -20,6 +20,7 @@ from src.core.trading.analysis import MarketAnalyzer
 from src.core.trading.risk import RiskManager
 from src.utils import helpers
 import numpy as np
+from src.utils import pair_utils
 
 logger = logging.getLogger(__name__)
 
@@ -78,42 +79,101 @@ class AdvancedAITrader(BaseTrader):
             logger.error(f"Erreur lors de la récupération du solde: {e}")
             return 0.0
 
-    def is_config_valid(self) -> bool:
+    async def is_config_valid(self) -> bool:
         """
         Vérifie si la configuration est valide.
+        
+        Note:
+            Cette méthode est maintenant asynchrone car elle nécessite l'initialisation
+            des paires de trading.
 
         Returns:
             bool: True si la configuration est valide, False sinon
         """
+        # Import relatif pour éviter les problèmes de chemin
+        from ..market.available_pairs import initialize_available_pairs
+        
         if not self.config:
             return False
-
-        required_keys = [
-            'trading_pair',
-            'trading_amount',
-            'trading_fee',
-            'risk_level',
-            'quote_currency',
-            'min_volume_btc',
-            'max_spread_pct',
-            'min_trades_24h',
-            'max_daily_drawdown',
-            'risk_percentage',
-            'max_leverage']
-
-        return all(key in self.config for key in required_keys)
+            
+        try:
+            # Initialiser les paires de trading
+            available_pairs = await initialize_available_pairs()
+            
+            required_keys = [
+                'trading_pair',
+                'trading_amount',
+                'trading_fee',
+                'risk_level',
+                'quote_currency',
+                'min_volume_btc',
+                'max_spread_pct',
+                'min_trades_24h',
+                'custom_pairs',
+                'max_daily_drawdown',
+                'risk_percentage',
+                'max_leverage'
+            ]
+            
+            # Vérifier que toutes les clés requises sont présentes
+            for key in required_keys:
+                if key not in self.config:
+                    logger.error(f"Clé de configuration manquante: {key}")
+            trading_pair = self.config.get('trading_pair')
+            if not trading_pair:
+                logger.error("Aucune paire de trading spécifiée dans la configuration")
+                return False
+                
+            # Vérifier si la paire est supportée par Kraken
+            if not available_pairs.is_pair_supported(trading_pair):
+                normalized = available_pairs.normalize_pair(trading_pair)
+                if normalized and available_pairs.is_pair_supported(normalized):
+                    # Mise à jour de la configuration avec la paire normalisée
+                    self.config['trading_pair'] = normalized
+                    logger.info(f"Paire normalisée : {trading_pair} -> {normalized}")
+                else:
+                    logger.error(f"Paire non supportée par Kraken : {trading_pair}")
+                    return False
+                    
+            # Vérification de la devise de cotation
+            quote_currency = self.config.get('quote_currency', '').upper()
+            if quote_currency and not available_pairs.is_quote_currency_supported(quote_currency):
+                logger.error(f"Devise de cotation non supportée : {quote_currency}")
+                return False
+                
+            return True
+            
+        except Exception as e:
+            logger.error(f"Erreur lors de la validation de la configuration : {e}")
+            return False
 
     async def run(self) -> None:
-        """Boucle principale du trader avancé."""
+        """Boucle principale du trader avancé.
+        
+        Cette méthode gère le cycle de vie complet du trader, y compris :
+        1. L'initialisation des composants
+        2. La mise à jour des données de marché
+        3. L'analyse du marché et génération de signaux
+        4. La gestion des risques et exécution des trades
+        5. La mise à jour des positions et journalisation
+        """
         logger.info("Démarrage du trader avancé...")
+        
+        # Initialisation du trader (appelle super().initialize() en interne)
         await self._initialize()
+        
+        # Intervalle entre les itérations (en secondes)
+        tick_interval = self.config.get('tick_interval', 60)
 
         while not self._stop_event.is_set():
             try:
-                # 1. Mise à jour des données
+                # 1. Mise à jour des données de marché
                 await self._update_market_data()
 
                 # 2. Analyse du marché
+                await self.analyze_market()
+                
+                # 2.1 Analyse supplémentaire pour chaque paire (si nécessaire)
                 for pair, data in self.market_data.items():
                     if hasattr(self.market_analyzer, 'analyze_market') and callable(getattr(self.market_analyzer, 'analyze_market')):
                         analysis = self.market_analyzer.analyze_market(data)
@@ -123,33 +183,42 @@ class AdvancedAITrader(BaseTrader):
                 signals = await self.generate_signals()
 
                 # 4. Gestion des risques
+                risk_signals = signals
                 if hasattr(self.risk_manager, 'process_signals') and callable(getattr(self.risk_manager, 'process_signals')):
                     risk_signals = self.risk_manager.process_signals(signals)
-                else:
-                    risk_signals = signals
 
-                # 5. Exécution des trades
-                await self.execute_trades(risk_signals)
-
-                # 6. Mise à jour des positions
+                # 5. Exécution des décisions de trading
+                await self.execute_trading_decisions(risk_signals)
+                
+                # 5.1 Mise à jour des positions
                 await self.manage_positions()
 
-                # 7. Journalisation du statut
-                status = self.get_trading_status()
-                self.logger.info(f"Statut du trading: {status}")
+                # 6. Mise à jour de l'état des ordres et positions
+                await self.update_orders_and_positions()
 
-                # 8. Sauvegarde dans la base de données
-                if self.db_manager:
+                # 7. Journalisation de l'état actuel
+                status = self.get_trading_status()
+                logger.info(f"Statut du trading: {status}")
+                await self._log_trading_status()
+                
+                # 8. Sauvegarde dans la base de données (si disponible)
+                if self.db_manager and hasattr(self.db_manager, 'save_trading_status'):
                     await self.db_manager.save_trading_status(status)
 
-                await asyncio.sleep(5)  # Mise à jour toutes les 5 secondes
+                # Attente avant la prochaine itération
+                await asyncio.sleep(tick_interval)
 
             except asyncio.CancelledError:
-                logger.info("Arrêt demandé...")
+                logger.info("Arrêt du trader demandé...")
                 break
+                
             except Exception as e:
-                self.logger.error(f"Erreur dans la boucle principale: {e}")
-                await asyncio.sleep(10)  # Attendre avant de réessayer
+                logger.error(
+                    f"Erreur dans la boucle principale: {e}",
+                    exc_info=True
+                )
+                # Attente plus longue en cas d'erreur
+                await asyncio.sleep(min(tick_interval * 2, 300))  # Maximum 5 minutes
 
     def _calculate_stop_loss(self,
                              signal: TradeSignal) -> Decimal:
@@ -246,31 +315,79 @@ class AdvancedAITrader(BaseTrader):
 
     async def _update_market_data(self) -> None:
         """Met à jour les données de marché pour toutes les paires de trading."""
+        logger.info("🔄 Début de la mise à jour des données de marché...")
         try:
-            for pair in self.config.get('trading_pairs', []):
+            trading_pairs = self.config.get('trading_pairs', [])
+            logger.info(f"📊 Nombre de paires à traiter: {len(trading_pairs)}")
+            
+            if not trading_pairs:
+                logger.warning("⚠️ Aucune paire de trading configurée dans config['trading_pairs']")
+                return
+                
+            for i, pair in enumerate(trading_pairs, 1):
                 try:
-                    if hasattr(self.api, 'get_ticker') and callable(getattr(self.api, 'get_ticker')):
-                        ticker = await self.api.get_ticker(pair=pair)
-                    else:
-                        raise NotImplementedError("La méthode get_ticker n'est pas disponible sur l'API Kraken.")
+                    logger.debug(f"[{i}/{len(trading_pairs)}] Traitement de la paire: {pair}")
+                    
+                    if not hasattr(self.api, 'get_ticker') or not callable(getattr(self.api, 'get_ticker', None)):
+                        logger.error("❌ L'API ne possède pas de méthode get_ticker valide")
+                        continue
+                        
+                    # Extraire le symbole de la paire (peut être un dict ou une chaîne)
+                    pair_symbol = pair['pair'] if isinstance(pair, dict) and 'pair' in pair else pair
+                    
+                    # S'assurer que pair_symbol est bien une chaîne
+                    if not isinstance(pair_symbol, str):
+                        logger.error(f"❌ Le symbole de paire doit être une chaîne, reçu: {type(pair_symbol).__name__} - {pair_symbol}")
+                        continue
+                        
+                    # Normaliser la paire au format wsname Kraken avant l'appel API
+                    try:
+                        pair_symbol = pair_utils.normalize_pair_input(pair_symbol)
+                        logger.debug(f"Paire normalisée: {pair_symbol}")
+                    except Exception as e:
+                        logger.error(f"❌ Erreur lors de la normalisation de la paire {pair_symbol}: {e}")
+                        continue
+                        
+                    logger.debug(f"Appel de get_ticker pour la paire: '{pair_symbol}' (type: {type(pair_symbol).__name__})")
+                    try:
+                        ticker = await self.api.get_ticker(pair=pair_symbol)
+                        logger.debug(f"Réponse get_ticker pour {pair_symbol}: {ticker}")
+                    except Exception as e:
+                        logger.error(f"❌ Erreur lors de l'appel à get_ticker pour {pair_symbol}: {str(e)}")
+                        continue
 
-                    if ticker:
+                    if not ticker or 'result' not in ticker or not ticker['result']:
+                        logger.warning(f"⚠️ Réponse de get_ticker vide ou invalide pour {pair_symbol}")
+                        continue
+
+                    # Extraire les données du ticker
+                    ticker_data = ticker['result'].get(pair_symbol, {}) if isinstance(ticker['result'], dict) else {}
+                    
+                    if not ticker_data:
+                        logger.warning(f"⚠� Aucune donnée de ticker pour {pair} dans la réponse")
+                        continue
+
+                    # Mettre à jour les prix avec gestion des erreurs
+                    try:
                         self.prices[pair] = {
-                            'last': float(ticker.get('c', {}).get('price', 0)),
-                            'bid': float(ticker.get('b', {}).get('price', 0)),
-                            'ask': float(ticker.get('a', {}).get('price', 0))
+                            'bid': float(ticker_data.get('b', [0])[0] if isinstance(ticker_data.get('b'), list) else 0),
+                            'ask': float(ticker_data.get('a', [0])[0] if isinstance(ticker_data.get('a'), list) else 0)
                         }
+                        logger.info(f"✅ Prix mis à jour pour {pair}: {self.prices[pair]}")
+                    except (IndexError, ValueError, TypeError) as e:
+                        logger.error(f"❌ Erreur lors de l'extraction des prix pour {pair}: {e}")
+                        continue
 
-                        logger.debug(
-                            f"Mise à jour des prix pour {pair}: {self.prices[pair]}")
-
+                except asyncio.TimeoutError:
+                    logger.error(f"⏱️ Timeout lors de la récupération du ticker pour {pair}")
                 except Exception as e:
-                    logger.error(
-                        f"Erreur lors de la mise à jour des données pour {pair}: {e}")
+                    logger.error(f"❌ Erreur lors de la mise à jour des données pour {pair}: {e}", exc_info=True)
+
+            logger.info("✅ Mise à jour des données de marché terminée")
 
         except Exception as e:
-            logger.error(
-                f"Erreur lors de la mise à jour des données de marché: {e}")
+            logger.error(f"❌ Erreur critique dans _update_market_data: {e}", exc_info=True)
+            raise
 
     async def _log_trading_status(self) -> None:
         """Log l'état actuel du trading."""
@@ -295,12 +412,14 @@ class AdvancedAITrader(BaseTrader):
     async def run(self) -> None:
         """Boucle principale du trader."""
         logger.info("Démarrage du trader avancé...")
-        await self.initialize()
+        
+        # Initialisation du trader (appelle super().initialize() en interne)
+        await self._initialize()
 
         while not self._stop_event.is_set():
             try:
                 # 1. Mettre à jour les données de marché
-                await self.update_market_data()
+                await self._update_market_data()
 
                 # 2. Analyser le marché
                 await self.analyze_market()
@@ -355,17 +474,45 @@ class AdvancedAITrader(BaseTrader):
             logger.error(f"Erreur lors de l'analyse du marché: {e}")
 
     async def generate_signals(self) -> Dict[str, Dict]:
-        """Génère des signaux de trading pour toutes les paires."""
+        """
+        Génère des signaux de trading pour toutes les paires.
+        
+        Returns:
+            Dict[str, Dict]: Dictionnaire des signaux par paire
+        """
         signals = {}
 
-        for pair, ohlcv_data in self.market_data.items():
+        for pair, market_data in self.market_data.items():
             try:
+                # Vérifier si les données OHLCV sont disponibles
+                if not hasattr(market_data, 'candles') or not market_data.candles:
+                    logger.warning(f"Aucune donnée OHLCV disponible pour {pair}")
+                    continue
+                    
+                # Préparer les données OHLCV au format attendu par le SignalGenerator
+                ohlcv_data = {}
+                for tf, candles in market_data.candles.items():
+                    # Convertir les bougies en DataFrame pandas
+                    df = pd.DataFrame([{
+                        'open': c.open,
+                        'high': c.high,
+                        'low': c.low,
+                        'close': c.close,
+                        'volume': c.volume,
+                        'timestamp': pd.to_datetime(c.timestamp, unit='ms')
+                    } for c in candles])
+                    df.set_index('timestamp', inplace=True)
+                    ohlcv_data[tf] = df
+                
+                # Extraire le carnet d'ordres s'il est disponible
+                order_book = market_data.order_book if hasattr(market_data, 'order_book') else None
+                
                 # Générer les signaux pour cette paire
                 signals[pair] = await self.signal_generator.generate_signals(
                     ohlc_data=ohlcv_data,
                     pair=pair,
-                    # Plus petit timeframe disponible
-                    timeframe=min(ohlcv_data.keys())
+                    timeframe=min(ohlcv_data.keys()),  # Plus petit timeframe disponible
+                    order_book=order_book  # Passer le carnet d'ordres
                 )
 
                 # Journaliser les signaux
@@ -375,7 +522,9 @@ class AdvancedAITrader(BaseTrader):
 
             except Exception as e:
                 logger.error(
-                    f"Erreur lors de la génération des signaux pour {pair}: {e}")
+                    f"Erreur lors de la génération des signaux pour {pair}: {e}",
+                    exc_info=True
+                )
 
         return signals
 

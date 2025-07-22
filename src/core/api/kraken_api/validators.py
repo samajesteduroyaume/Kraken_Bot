@@ -10,24 +10,46 @@ import logging
 class Validator:
     def __init__(self):
         self.logger = logging.getLogger(__name__ + '.Validator')
+        from src.utils.pair_utils import normalize_pair_input
+        self.normalize_pair_input = normalize_pair_input
 
     def validate_pair(self, pair: str) -> None:
-        """Valide une paire de trading."""
+        """Valide une paire de trading.
+        
+        Cette méthode accepte les formats suivants :
+        - Formats avec séparateur : BTC/USD, BTC-USD
+        - Formats natifs Kraken : XXBTZUSD, XBTUSDT, APEEUR, etc.
+        """
         if not isinstance(pair, str):
-            self.logger.error(
-                f"Type invalide pour pair: {type(pair).__name__}")
-            raise ValueError("La paire doit être une chaîne")
+            self.logger.error(f"Type invalide pour pair: {type(pair).__name__}")
+            raise ValueError("La paire doit être une chaîne de caractères")
 
         if not pair.strip():
-            self.logger.error(
-                "La paire ne peut pas être vide ou contenir uniquement des espaces")
-            raise ValueError(
-                "La paire ne peut pas être vide ou contenir uniquement des espaces")
+            self.logger.error("La paire ne peut pas être vide ou contenir uniquement des espaces")
+            raise ValueError("La paire ne peut pas être vide ou contenir uniquement des espaces")
 
-        if '-' not in pair or len(pair) > 20:
-            self.logger.error(f"Format invalide pour la paire: {pair}")
+        # Vérifier d'abord si c'est un format natif Kraken valide
+        try:
+            # Si la normalisation réussit, c'est une paire valide
+            normalized = self.normalize_pair_input(pair)
+            # Vérifier la longueur maximale (par sécurité)
+            if len(normalized) > 30:  # Augmenté pour les paires comme XBTUSDT.M, etc.
+                raise ValueError("La paire est trop longue")
+            return  # La paire est valide
+        except Exception as e:
+            # Si la normalisation échoue, vérifier si c'est un format avec séparateur
+            if '-' in pair or '/' in pair:
+                # Vérifier la longueur pour les formats avec séparateur
+                if len(pair) > 20:
+                    self.logger.error(f"Paire trop longue: {pair}")
+                    raise ValueError("La paire avec séparateur est trop longue (max 20 caractères)")
+                return  # Format avec séparateur valide
+            
+            # Si on arrive ici, la paire n'est dans aucun format valide
+            self.logger.error(f"Format de paire non reconnu: {pair} - {str(e)}")
             raise ValueError(
-                "La paire doit contenir un tiret et avoir une longueur maximale de 20 caractères")
+                "Format de paire invalide. Utilisez le format 'BTC/USD', 'BTC-USD' ou le format natif Kraken comme 'XXBTZUSD'"
+            )
 
     def validate_timestamp(self, timestamp: Optional[int]) -> None:
         """Valide un timestamp."""
@@ -52,6 +74,22 @@ class Validator:
             self.logger.error(f"Intervalle invalide: {interval}")
             raise ValueError(
                 f"L'intervalle doit être l'un des suivants: {allowed_intervals}")
+                
+    def validate_ohlc_interval(self, interval: int) -> None:
+        """
+        Valide un intervalle de temps pour les données OHLC.
+        
+        Args:
+            interval: Intervalle en minutes à valider
+            
+        Raises:
+            ValueError: Si l'intervalle n'est pas valide
+        """
+        allowed_intervals = [1, 5, 15, 30, 60, 240, 1440, 10080, 21600]
+        if interval not in allowed_intervals:
+            self.logger.error(f"Intervalle OHLC invalide: {interval}")
+            raise ValueError(
+                f"L'intervalle OHLC doit être l'un des suivants: {allowed_intervals}")
 
     def validate_order_params(self, params: Dict[str, Any]) -> None:
         """Valide les paramètres d'un ordre."""

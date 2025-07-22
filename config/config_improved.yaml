@@ -1,0 +1,252 @@
+# Configuration du bot de trading Kraken
+# Version améliorée avec support avancé des stratégies
+
+# Configuration de l'API (à déplacer dans .env pour la sécurité)
+api:
+  api_key: ""  # À définir dans .env
+  api_secret: ""  # À définir dans .env
+  enable_rate_limit: true
+  timeout: 30000  # ms
+
+# Configuration générale du trading
+trading:
+  # Paires de trading (sélection des plus liquides)
+  pairs:
+    - XBT/USD
+    - XBT/USDC
+    - XBT/USDT
+    - ETH/USD
+    - ETH/USDT
+    - ETH/USDC
+    - XRP/USD
+    - SOL/USD
+    - ADA/USD
+    - DOT/USD
+    - LINK/USD
+    - MATIC/USD
+    - DOGE/USD
+    - AVAX/USD
+    - ATOM/USD
+    - ALGO/USD
+    - FIL/USD
+    - LTC/USD
+    - UNI/USD
+    - AAVE/USD
+  
+  # Paramètres généraux
+  min_score: 0.3
+  min_volume: 1000000  # Volume minimum en USD sur 24h
+  max_positions: 2
+  max_holding_time: 86400  # secondes (24h)
+  max_concurrent_requests: 1
+  analysis_timeout: 60.0  # secondes
+  max_pairs_to_analyze: 10
+  
+  # Filtres d'actifs
+  exclude_illiquid: true
+  min_daily_trades: 200
+  min_market_cap: 100000000  # 100M
+  exclude_stablecoins: true
+  exclude_leveraged: true
+
+# Configuration des stratégies
+strategies:
+  # Stratégie Momentum
+  momentum:
+    enabled: true
+    weight: 0.3  # Poids dans la décision globale
+    timeframes: ["15m", "1h", "4h"]
+    indicators:
+      rsi_period: 14
+      rsi_overbought: 70
+      rsi_oversold: 30
+      macd_fast: 12
+      macd_slow: 26
+      macd_signal: 9
+      atr_period: 14
+      adx_period: 14
+      adx_threshold: 25
+    risk:
+      max_risk: 0.02
+      take_profit: 0.04
+      stop_loss: 0.02
+      max_position_size: 0.1  # 10% du capital
+  
+  # Stratégie Grid Trading
+  grid:
+    enabled: true
+    weight: 0.2
+    grid_upper_price: 50000.0  # À ajuster selon la paire
+    grid_lower_price: 30000.0  # À ajuster selon la paire
+    grid_levels: 10
+    position_size: 0.1  # 10% du capital par position
+    take_profit_pct: 2.0
+    stop_loss_pct: 1.0
+    
+  # Stratégie Mean Reversion
+  mean_reversion:
+    enabled: true
+    weight: 0.2
+    bollinger_period: 20
+    bollinger_std: 2.0
+    rsi_period: 14
+    rsi_overbought: 70
+    rsi_oversold: 30
+    take_profit: 1.5
+    stop_loss: 1.0
+    
+  # Stratégie Breakout
+  breakout:
+    enabled: true
+    weight: 0.15
+    resistance_period: 20
+    support_period: 20
+    volume_ma_period: 20
+    min_volume_multiplier: 1.5
+    confirmation_bars: 2
+    
+  # Stratégie Swing Trading
+  swing:
+    enabled: true
+    weight: 0.15
+    ema_fast: 9
+    ema_slow: 21
+    rsi_period: 14
+    rsi_overbought: 70
+    rsi_oversold: 30
+    atr_period: 14
+    atr_multiplier: 2.0
+
+# Gestion des risques
+risk_management:
+  risk_level: medium  # low, medium, high
+  max_risk_per_trade: 0.02  # 2% du capital par trade
+  max_daily_risk: 0.1  # 10% du capital par jour
+  max_drawdown: 0.1  # 10% de drawdown maximum
+  position_sizing: kelly  # fixed, kelly, optimal_f
+  max_leverage: 1.0  # Effet de levier maximum
+  
+# Configuration des ordres
+orders:
+  type: limit  # market, limit, stop_loss, take_profit
+  time_in_force: GTC  # GTC, IOC, FOK
+  post_only: true
+  reduce_only: false
+  max_slippage: 0.1  # 0.1%
+  
+  # Paramètres pour les ordres avancés
+  iceberg: false
+  iceberg_qty: 0.0
+  hidden: false
+  
+  # Paramètres pour les ordres conditionnels
+  trailing_stop: false
+  trailing_stop_distance: 1.0  # %
+  trailing_stop_step: 0.5  # %
+
+# Configuration du backtesting
+backtesting:
+  enabled: false
+  initial_balance: 10000.0
+  start_date: "2023-01-01"
+  end_date: "2023-12-31"
+  timeframe: "1h"
+  commission: 0.001  # 0.1% par trade
+  slippage: 0.0005  # 0.05%
+  
+  # Métriques de performance
+  metrics:
+    - sharpe_ratio
+    - max_drawdown
+    - win_rate
+    - profit_factor
+    - sortino_ratio
+    - calmar_ratio
+
+# Surveillance et alertes
+monitoring:
+  # Alertes par email
+  email:
+    enabled: false
+    smtp_server: "smtp.example.com"
+    smtp_port: 587
+    smtp_user: ""
+    smtp_password: ""  # À définir dans .env
+    from_email: "bot@example.com"
+    to_emails: ["user@example.com"]
+    
+  # Alertes Telegram
+  telegram:
+    enabled: false
+    bot_token: ""  # À définir dans .env
+    chat_id: ""
+    
+  # Seuils d'alerte
+  alerts:
+    drawdown_alert: 0.05  # 5%
+    daily_pnl_alert: -0.03  # -3%
+    position_size_alert: 0.2  # 20% du capital
+    error_notifications: true
+
+# Configuration de la base de données
+postgres:
+  enabled: true
+  user: kraken_bot
+  password: password  # À définir dans .env
+  host: localhost
+  port: 5432
+  database: kraken_bot
+  
+# Configuration du machine learning
+ml:
+  enabled: false
+  model_path: "models/"
+  window_size: 20
+  train_size: 0.8
+  test_size: 0.2
+  n_estimators: 100
+  max_depth: 10
+  retrain_interval: 86400  # secondes (24h)
+  
+# Configuration des logs
+log:
+  level: INFO  # DEBUG, INFO, WARNING, ERROR, CRITICAL
+  log_dir: "logs"
+  max_bytes: 10485760  # 10MB
+  backup_count: 5
+  console: true
+  file: true
+  
+  # Format des logs
+  format: "%(asctime)s - %(name)s - %(levelname)s - %(message)s"
+  date_format: "%Y-%m-%d %H:%M:%S"
+
+# Configuration de Redis
+redis:
+  enabled: true
+  host: "localhost"
+  port: 6379
+  db: 0
+  password: ""  # À définir dans .env si nécessaire
+  socket_timeout: 5.0
+  socket_connect_timeout: 5.0
+  socket_keepalive: true
+  socket_keepalive_options: {tcp_keepalive: true, tcp_keepalive_idle: 60, tcp_keepalive_count: 3, tcp_keepalive_interval: 10}
+  retry_on_timeout: true
+  max_connections: 10
+  health_check_interval: 30  # secondes
+
+# Configuration du serveur web (pour le dashboard)
+web:
+  enabled: false
+  host: "0.0.0.0"
+  port: 5000
+  debug: false
+  secret_key: ""  # À définir dans .env
+  
+# Configuration des mises à jour
+auto_update:
+  enabled: true
+  check_interval: 86400  # secondes (24h)
+  github_repo: "samajesteduroyaume/Kraken_Bot"
+  branch: "main"

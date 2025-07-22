@@ -28,7 +28,8 @@ class SignalGenerator:
     async def generate_signals(self,
                                ohlc_data: Dict[str, pd.DataFrame],
                                pair: str,
-                               timeframe: str = '1h') -> Dict[str, Any]:
+                               timeframe: str = '1h',
+                               order_book: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
         """
         Génère des signaux de trading pour une paire donnée.
 
@@ -36,6 +37,7 @@ class SignalGenerator:
             ohlc_data: Données OHLCV par timeframe
             pair: Paire de trading (ex: 'BTC/USD')
             timeframe: Timeframe pour l'analyse
+            order_book: Snapshot du carnet d'ordres (optionnel)
 
         Returns:
             Dictionnaire contenant les signaux générés
@@ -47,7 +49,7 @@ class SignalGenerator:
         signals = {}
 
         # 1. Signaux basés sur les indicateurs techniques
-        signals.update(self._generate_technical_signals(df))
+        signals.update(self._generate_technical_signals(df, order_book))
 
         # 2. Signaux basés sur le ML
         ml_signals = await self._generate_ml_signals(df, pair)
@@ -58,8 +60,17 @@ class SignalGenerator:
 
         return signals
 
-    def _generate_technical_signals(self, df: pd.DataFrame) -> Dict[str, Any]:
-        """Génère des signaux basés sur des indicateurs techniques."""
+    def _generate_technical_signals(self, df: pd.DataFrame, order_book: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
+        """
+        Génère des signaux basés sur des indicateurs techniques et les données du carnet d'ordres.
+        
+        Args:
+            df: DataFrame contenant les données OHLCV
+            order_book: Snapshot du carnet d'ordres (optionnel) contenant 'bids', 'asks' et 'metrics'
+            
+        Returns:
+            Dictionnaire des signaux techniques enrichis des métriques du carnet d'ordres
+        """
         signals = {}
 
         # RSI
@@ -90,9 +101,91 @@ class SignalGenerator:
             window=14)
         signals['adx'] = adx.adx().iloc[-1]
         signals['adx_signal'] = 'strong_trend' if signals['adx'] > 25 else 'weak_trend'
+        
+        # Métriques du carnet d'ordres (si disponible)
+        if order_book and 'metrics' in order_book:
+            metrics = order_book['metrics']
+            signals.update({
+                'order_book_imbalance': metrics.get('imbalance', 0.0),
+                'order_book_spread': metrics.get('spread', 0.0),
+                'vwap_bid': metrics.get('vwap_bid', 0.0),
+                'vwap_ask': metrics.get('vwap_ask', 0.0),
+                'liquidity_imbalance': self._calculate_liquidity_imbalance(order_book)
+            })
+            
+            # Signaux basés sur le carnet d'ordres
+            signals.update(self._generate_order_book_signals(order_book, df['close'].iloc[-1]))
 
         return signals
 
+    def _calculate_liquidity_imbalance(self, order_book: Dict[str, Any], depth_levels: int = 5) -> float:
+        """
+        Calcule le déséquilibre de liquidité sur les N premiers niveaux du carnet d'ordres.
+        
+        Args:
+            order_book: Carnet d'ordres avec 'bids' et 'asks'
+            depth_levels: Nombre de niveaux à considérer
+            
+        Returns:
+            Ratio de déséquilibre entre l'offre et la demande (-1 à 1)
+        """
+        try:
+            bids = order_book.get('bids', [])[:depth_levels]
+            asks = order_book.get('asks', [])[:depth_levels]
+            
+            if not bids or not asks:
+                return 0.0
+                
+            total_bid_volume = sum(float(bid['amount']) for bid in bids)
+            total_ask_volume = sum(float(ask['amount']) for ask in asks)
+            
+            if total_bid_volume + total_ask_volume == 0:
+                return 0.0
+                
+            return (total_bid_volume - total_ask_volume) / (total_bid_volume + total_ask_volume)
+            
+        except Exception as e:
+            logging.warning(f"Erreur dans le calcul du déséquilibre de liquidité: {e}")
+            return 0.0
+    
+    def _generate_order_book_signals(self, order_book: Dict[str, Any], current_price: float) -> Dict[str, Any]:
+        """
+        Génère des signaux basés sur l'analyse du carnet d'ordres.
+        
+        Args:
+            order_book: Carnet d'ordres avec 'bids', 'asks' et 'metrics'
+            current_price: Prix actuel du marché
+            
+        Returns:
+            Dictionnaire de signaux basés sur le carnet d'ordres
+        """
+        signals = {}
+        
+        try:
+            metrics = order_book.get('metrics', {})
+            spread = metrics.get('spread', 0.0)
+            imbalance = metrics.get('imbalance', 0.0)
+            
+            # Signal basé sur le spread
+            signals['spread_ratio'] = spread / current_price if current_price > 0 else 0.0
+            signals['spread_signal'] = 'high' if signals['spread_ratio'] > 0.0015 else 'normal'
+            
+            # Signal basé sur le déséquilibre
+            signals['imbalance_ratio'] = imbalance
+            signals['imbalance_signal'] = 'buy' if imbalance > 0.2 else 'sell' if imbalance < -0.2 else 'neutral'
+            
+            # Signal basé sur le VWAP
+            if 'vwap_bid' in metrics and 'vwap_ask' in metrics and current_price > 0:
+                mid_vwap = (metrics['vwap_bid'] + metrics['vwap_ask']) / 2
+                signals['vwap_premium'] = (current_price - mid_vwap) / mid_vwap
+                signals['vwap_signal'] = 'overbought' if signals['vwap_premium'] > 0.001 else \
+                                       'oversold' if signals['vwap_premium'] < -0.001 else 'neutral'
+            
+        except Exception as e:
+            logging.warning(f"Erreur dans la génération des signaux du carnet d'ordres: {e}")
+        
+        return signals
+    
     async def _generate_ml_signals(self,
                                    df: pd.DataFrame,
                                    pair: str) -> Dict[str, Any]:

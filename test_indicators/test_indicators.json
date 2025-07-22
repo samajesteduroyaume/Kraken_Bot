@@ -1,0 +1,56 @@
+{
+  "indicators": [
+    {
+      "name": "sma_20",
+      "type": "trend",
+      "params": {
+        "window": 20
+      },
+      "enabled": true,
+      "display_name": "SMA 20",
+      "description": "Moyenne mobile simple sur 20 p\u00e9riodes"
+    },
+    {
+      "name": "ema_50",
+      "type": "trend",
+      "params": {
+        "window": 50
+      },
+      "enabled": true,
+      "display_name": "EMA 50",
+      "description": "Moyenne mobile exponentielle sur 50 p\u00e9riodes"
+    },
+    {
+      "name": "rsi_14",
+      "type": "momentum",
+      "params": {
+        "window": 14
+      },
+      "enabled": true,
+      "display_name": "RSI 14",
+      "description": "Relative Strength Index sur 14 p\u00e9riodes"
+    },
+    {
+      "name": "bollinger_bands",
+      "type": "volatility",
+      "params": {
+        "window": 20,
+        "window_dev": 2
+      },
+      "enabled": true,
+      "display_name": "Bandes de Bollinger",
+      "description": "Bandes de Bollinger (20, 2)"
+    },
+    {
+      "name": "volume_ma_20",
+      "type": "volume",
+      "params": {
+        "window": 20
+      },
+      "enabled": true,
+      "display_name": "Volume MA 20",
+      "description": "Moyenne mobile du volume sur 20 p\u00e9riodes"
+    }
+  ],
+  "last_updated": "2025-07-21T15:47:49.602715"
+}

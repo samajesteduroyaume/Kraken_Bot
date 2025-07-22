@@ -1,13 +1,16 @@
 import pandas as pd
-from typing import Dict, Optional
+from typing import Dict, Optional, List, Any
 from datetime import datetime, timedelta
 from concurrent.futures import ThreadPoolExecutor
+
+# Importer la fonction de normalisation robuste
+from src.utils.pair_utils import normalize_pair_input
 
 from src.core.simulation_mode import SimulationConfig
 from src.core.api.kraken import KrakenAPI
 from src.core.ml_predictor import MLPredictor
 from src.core.technical_analyzer import TechnicalAnalyzer
-from src.core.services.pair_selector import PairSelector
+from src.core.services.pair_selector.core import PairSelector
 from src.core.pair_rotation import PairRotationStrategy
 from src.core.market_trend_detector import MarketTrendDetector
 from src.core.pair_cluster_analyzer import PairClusterAnalyzer
@@ -76,13 +79,15 @@ class MultiPairTrader:
 
         # Initialiser le sélecteur de paires avec la configuration
         self.pair_selector = PairSelector(
-            api=api,
-            max_pairs=max_trading_pairs,
-            min_volume=100000,  # Valeur par défaut
-            volatility_window=20,
-            momentum_window=14,
-            executor=self.executor,
-            config=config
+            kraken_api=api,  # Correction: utiliser kraken_api au lieu de api
+            config={
+                'max_pairs': max_trading_pairs,
+                'min_volume': 100000,
+                'volatility_window': 20,
+                'momentum_window': 14,
+                'executor': self.executor,
+                **config
+            }
         )
 
         # Initialiser la stratégie de rotation
@@ -133,10 +138,14 @@ class MultiPairTrader:
             
             # Construire le dictionnaire de métriques pour les paires sélectionnées
             pair_metrics = {}
-            for pair in valid_pairs:
-                metrics = self.pair_selector.get_pair_metrics(pair)
-                if metrics:
-                    pair_metrics[pair] = metrics
+            for pair_info in valid_pairs:
+                try:
+                    pair_name = pair_info['pair']  # Accès au nom de la paire normalisée
+                    metrics = self.pair_selector.get_pair_metrics(pair_name)
+                    if metrics:
+                        pair_metrics[pair_name] = metrics
+                except (KeyError, TypeError) as e:
+                    self.logger.error(f"Erreur lors de l'extraction des métriques pour la paire {pair_info}: {e}")
             self.pair_metrics = pair_metrics
 
             # Mettre à jour l'analyse des clusters
@@ -198,11 +207,24 @@ class MultiPairTrader:
             if not selected_pairs:
                 logger.warning("Aucune paire valide trouvée pour l'initialisation des traders")
                 return
+            
+            # Extraire les noms de paires normalisés
+            pair_names = []
+            for pair_info in selected_pairs:
+                try:
+                    pair_name = pair_info['pair']
+                    pair_names.append(pair_name)
+                except (KeyError, TypeError) as e:
+                    logger.warning(f"Format de paire invalide ignoré: {pair_info} - {e}")
+            
+            if not pair_names:
+                logger.warning("Aucun nom de paire valide n'a pu être extrait")
+                return
                 
-            logger.info(f"Initialisation de {len(selected_pairs)} traders pour les paires: {', '.join(selected_pairs)}")
+            logger.info(f"Initialisation de {len(pair_names)} traders pour les paires: {', '.join(pair_names)}")
 
             # Initialiser les traders pour les paires sélectionnées
-            for pair in selected_pairs:
+            for pair in pair_names:
                 # Calculer le risque par trade pour cette paire
                 risk_per_trade = self.risk_per_pair / len(selected_pairs)
 
@@ -495,19 +517,60 @@ class MultiPairTrader:
             }
 
             logger.info(
-                f"Trader {pair} terminé. Profit total: {trader.metrics['total_profit']:.2f} USD")
+                f"Trader {pair} terminé. Profit total: {trader.metrics['total_profit']:.2f} USD"
+            )
 
         except Exception as e:
             logger.error(f"Erreur dans le trader {pair}: {str(e)}")
             raise
-        """Exécute un trader pour une paire spécifique avec gestion des tendances."""
+
+    async def _run_trader(self, pair_input: Any):
+        """
+        Exécute un trader pour une paire spécifique avec gestion des risques.
+        
+        Args:
+            pair_input: Peut être une chaîne (nom de paire) ou un dictionnaire avec une clé 'pair'
+        """
         try:
+            # Normaliser l'entrée de la paire avec gestion des erreurs améliorée
+            try:
+                if isinstance(pair_input, dict) and 'pair' in pair_input:
+                    pair = pair_input['pair']
+                elif isinstance(pair_input, str):
+                    # Utiliser raise_on_error=False pour gérer les erreurs nous-mêmes
+                    pair = normalize_pair_input(pair_input, raise_on_error=False)
+                    
+                    if not pair:
+                        # Si la paire n'est pas reconnue, essayer de trouver des alternatives
+                        try:
+                            # Cette fois avec raise_on_error=True pour obtenir les suggestions
+                            normalize_pair_input(pair_input, raise_on_error=True)
+                        except UnsupportedTradingPairError as e:
+                            # Afficher les suggestions dans les logs
+                            if e.alternatives:
+                                self.logger.warning(
+                                    f"Paire non reconnue: {pair_input}. "
+                                    f"Suggestions: {', '.join(e.alternatives[:3])}"
+                                )
+                            else:
+                                self.logger.warning(f"Paire non reconnue: {pair_input}. Aucune suggestion disponible.")
+                        except Exception as e:
+                            self.logger.error(f"Erreur lors de la recherche d'alternatives pour {pair_input}: {e}")
+                        return
+                else:
+                    self.logger.error(f"Format de paire non supporté: {pair_input}")
+                    return
+                    
+            except Exception as e:
+                self.logger.error(f"Erreur de normalisation de la paire {pair_input}: {e}")
+                return
+
             logger = self.logger.get_logger(f'trader_{pair}')
             logger.info(f"Démarrage du trader pour la paire {pair}")
 
             # Récupérer les données pour la paire
             ohlc_data = await get_price_history(self.api, self.config, pair)
-
+            
             # Détecter la tendance du marché
             market_trend = self.market_trend_detector.detect_trend(ohlc_data)
             logger.info(f"Tendance détectée: {market_trend}")

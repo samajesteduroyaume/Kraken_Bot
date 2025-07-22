@@ -3,7 +3,7 @@ import json
 import logging
 from datetime import datetime
 from typing import Dict, List, Any
-from src.core.config import Config
+from src.core.config_adapter import Config  # Migré vers le nouvel adaptateur
 import pandas as pd
 import matplotlib.pyplot as plt
 from pathlib import Path
@@ -27,10 +27,20 @@ class TradingReporter:
     def __init__(self, config: Config):
         """Initialise le générateur de rapports."""
         self.config = config
+        reporting_config = config.get_config('reporting')
         self.report_dir = os.path.expanduser(
-            config.REPORTING.get(
-                'dir', '~/kraken_bot_reports'))
-        self.email_config = config.EMAIL_REPORTING
+            reporting_config.get('report_dir', '~/kraken_bot_reports'))
+        
+        # Récupérer la configuration email depuis la configuration de reporting
+        self.email_config = {
+            'enabled': reporting_config.get('email_enabled', False),
+            'recipients': reporting_config.get('email_recipients', []),
+            'smtp_server': os.getenv('SMTP_SERVER', 'smtp.example.com'),
+            'smtp_port': int(os.getenv('SMTP_PORT', 587)),
+            'smtp_username': os.getenv('SMTP_USERNAME', ''),
+            'smtp_password': os.getenv('SMTP_PASSWORD', ''),
+            'from_email': os.getenv('SMTP_FROM_EMAIL', 'noreply@example.com')
+        }
 
         # Créer le répertoire des rapports s'il n'existe pas
         Path(self.report_dir).mkdir(parents=True, exist_ok=True)

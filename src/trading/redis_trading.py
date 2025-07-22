@@ -5,7 +5,7 @@ from datetime import datetime
 from src.cache.redis_cache import RedisCache
 from src.core.api.kraken import KrakenAPI
 from src.core.trading import TradingManager
-from src.core.config import Config
+from src.core.config_adapter import Config  # Migré vers le nouvel adaptateur
 
 # Configuration du logging
 logging.basicConfig(
@@ -24,15 +24,18 @@ class RedisTradingManager(TradingManager):
         self.loop = loop or asyncio.new_event_loop()
         asyncio.set_event_loop(self.loop)
 
-        # Initialiser l'API Kraken avec la configuration de test
-        api_config = {
+        # Récupérer la configuration de l'API
+        api_config = config.get_config('api', {})
+        
+        # Configuration par défaut pour les tests
+        test_config = {
             'credentials': {
                 'api_key': 'test_key',
                 'api_secret': 'test_secret'
             },
             'base_url': 'https://api.kraken.com',
             'version': '0',
-            'timeout': config.api.timeout,
+            'timeout': 30,  # Valeur par défaut
             'max_retries': 3,
             'retry_delay': 0.5,
             'cache_ttl': 60,
@@ -42,6 +45,12 @@ class RedisTradingManager(TradingManager):
                 'limit': 50
             }
         }
+        
+        # Fusionner avec la configuration de l'API si elle existe
+        if isinstance(api_config, dict):
+            test_config.update(api_config)
+        
+        api_config = test_config
 
         # Initialiser l'API Kraken avec le loop
         api = KrakenAPI(api_config, loop=self.loop)
@@ -295,7 +304,7 @@ class TradingSignalSubscriber:
             logger.info(f"Reçu signal pour {signal['symbol']}")
 
             # Récupérer les données de marché
-            market_data = await self.redis.get_market_data(signal['symbol'])
+            market_data = self.redis.get_market_data(signal['symbol'])
             if not market_data:
                 logger.warning(
                     f"Pas de données de marché pour {signal['symbol']}")

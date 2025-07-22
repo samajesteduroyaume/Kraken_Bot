@@ -108,14 +108,35 @@ class KrakenConfig:
         # Surcharge avec le fichier de configuration
         if config_file and os.path.exists(config_file):
             try:
+                self.logger.debug(f"[DEBUG] Chargement du fichier de configuration: {config_file}")
                 with open(config_file, 'r') as f:
                     file_config = json.load(f)
+                    self.logger.debug(f"[DEBUG] Configuration chargée depuis le fichier: {list(file_config.keys())}")
+                    
+                    # Log des sections disponibles dans le fichier de configuration
+                    if 'kraken' in file_config and isinstance(file_config['kraken'], dict):
+                        self.logger.debug("[DEBUG] Section 'kraken' trouvée dans le fichier de configuration")
+                        if 'api_key' in file_config['kraken']:
+                            masked_key = f"{str(file_config['kraken']['api_key'])[:4]}...{str(file_config['kraken']['api_key'])[-4:] if file_config['kraken']['api_key'] else ''}"
+                            self.logger.debug(f"[DEBUG] Clé API trouvée dans la section 'kraken': {masked_key}")
+                    
+                    if 'api_config' in file_config and isinstance(file_config['api_config'], dict):
+                        self.logger.debug("[DEBUG] Section 'api_config' trouvée dans le fichier de configuration")
+                        if 'api_key' in file_config['api_config']:
+                            masked_key = f"{str(file_config['api_config']['api_key'])[:4]}...{str(file_config['api_config']['api_key'])[-4:] if file_config['api_config']['api_key'] else ''}"
+                            self.logger.debug(f"[DEBUG] Clé API trouvée dans la section 'api_config': {masked_key}")
+                    
                     config.update(file_config)
+                    self.logger.debug("[DEBUG] Configuration mise à jour avec succès")
+                    
+            except json.JSONDecodeError as e:
+                error_msg = f"Erreur de syntaxe JSON dans le fichier de configuration: {str(e)}"
+                self.logger.error(f"[ERREUR] {error_msg}")
+                raise ConfigurationError(error_msg)
             except Exception as e:
-                self.logger.error(
-                    f"Erreur lors du chargement du fichier de configuration: {str(e)}")
-                raise ConfigurationError(
-                    f"Erreur lors du chargement du fichier de configuration: {str(e)}")
+                error_msg = f"Erreur lors du chargement du fichier de configuration: {str(e)}"
+                self.logger.error(f"[ERREUR] {error_msg}")
+                raise ConfigurationError(error_msg)
 
         # Surcharge avec les variables d'environnement
         env_vars = {
@@ -256,11 +277,71 @@ class KrakenConfig:
     def get_credentials(self) -> Dict[str, str]:
         """
         Récupère les informations d'authentification.
+        Vérifie plusieurs emplacements possibles pour les clés API :
+        1. Dans les variables d'environnement (priorité la plus haute)
+        2. Dans la section 'credentials' (format standard)
+        3. Dans la section 'kraken' (format alternatif)
+        4. Dans la section 'api_config' (format alternatif)
 
         Returns:
             Dictionnaire avec api_key et api_secret
+
+        Raises:
+            ConfigurationError: Si aucune clé API valide n'est trouvée
         """
-        return self.config['credentials']
+        credentials = {}
+        
+        # 0. Vérifier les variables d'environnement (priorité la plus haute)
+        env_api_key = os.getenv('KRAKEN_API_KEY')
+        env_api_secret = os.getenv('KRAKEN_API_SECRET')
+        
+        if env_api_key and env_api_secret:
+            self.logger.info("Utilisation des clés API depuis les variables d'environnement")
+            credentials['api_key'] = env_api_key
+            credentials['api_secret'] = env_api_secret
+        else:
+            # 1. Vérifier la section 'credentials' (format standard)
+            if 'credentials' in self.config and self.config['credentials']:
+                if 'api_key' in self.config['credentials'] and 'api_secret' in self.config['credentials']:
+                    credentials.update(self.config['credentials'])
+            
+            # 2. Vérifier la section 'kraken' (format alternatif)
+            if not credentials and 'kraken' in self.config and self.config['kraken']:
+                kraken_section = self.config['kraken']
+                if isinstance(kraken_section, dict):
+                    if 'api_key' in kraken_section and kraken_section['api_key']:
+                        credentials['api_key'] = kraken_section['api_key']
+                    if 'api_secret' in kraken_section and kraken_section['api_secret']:
+                        credentials['api_secret'] = kraken_section['api_secret']
+            
+            # 3. Vérifier la section 'api_config' (format alternatif)
+            if not credentials and 'api_config' in self.config and self.config['api_config']:
+                api_config = self.config['api_config']
+                if isinstance(api_config, dict):
+                    if 'api_key' in api_config and api_config['api_key']:
+                        credentials['api_key'] = api_config['api_key']
+                    if 'api_secret' in api_config and api_config['api_secret']:
+                        credentials['api_secret'] = api_config['api_secret']
+        
+        # Validation des clés
+        if not credentials.get('api_key') or not credentials.get('api_secret'):
+            error_msg = """
+            [ERREUR CRITIQUE] Aucune clé API valide n'a été trouvée.
+            Veuillez vérifier que :
+            1. Les variables d'environnement KRAKEN_API_KEY et KRAKEN_API_SECRET sont définies dans le fichier .env
+            2. Les clés sont correctement configurées dans config.yaml
+            3. Le fichier .env est bien chargé (vérifiez le chemin du fichier)
+            """
+            self.logger.error(error_msg)
+            raise ConfigurationError("Configuration d'authentification invalide")
+        
+        # Log des informations de débogage (masquées pour la sécurité)
+        masked_key = f"{credentials['api_key'][:4]}...{credentials['api_key'][-4:]}"
+        self.logger.info(f"Clé API chargée avec succès (masquée): {masked_key}")
+        source = "variables d'environnement" if env_api_key else "fichier de configuration"
+        self.logger.debug(f"Source des clés: {source}")
+        
+        return credentials
 
     def get_rate_limit(self) -> Dict[str, Any]:
         """

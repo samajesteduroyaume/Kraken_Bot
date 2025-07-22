@@ -1,0 +1,11 @@
+{
+  "valid_pairs": [
+    "XBTUSDC",
+    "XBTDAI",
+    "USDTZUSD",
+    "XBTUSDT",
+    "ETHUSDT",
+    "ETHDAI",
+    "ETHUSDC"
+  ]
+}

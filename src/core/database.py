@@ -8,7 +8,8 @@ import time
 from typing import Any, List, Optional, Dict
 from contextlib import asynccontextmanager
 from datetime import datetime, timedelta
-from src.core.config import Config
+# Import de la configuration depuis le module settings
+from src.config.settings import settings as Config
 import traceback
 
 # Alias pour les imports longs
@@ -19,7 +20,7 @@ logger = logging.getLogger(__name__)
 
 def get_db_config():
     """Récupère la configuration de la base de données de manière dynamique."""
-    return Config().db_config
+    return Config.db_config
 
 
 class DatabaseManager:

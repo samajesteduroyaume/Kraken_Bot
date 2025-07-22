@@ -1,6 +1,6 @@
 import logging
 from typing import Dict, Any
-from src.core.config import Config
+from src.core.config_adapter import Config  # Migré vers le nouvel adaptateur
 import json
 from datetime import datetime
 import asyncio

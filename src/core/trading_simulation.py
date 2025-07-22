@@ -17,7 +17,7 @@ from .config import Config
 from src.utils import helpers
 
 # Configuration globale
-config = Config()
+config = Config
 logger = LoggerManager('kraken_simulation').get_logger('kraken_simulation')
 
 

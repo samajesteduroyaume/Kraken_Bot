@@ -2,7 +2,7 @@ import logging
 from typing import Dict, List, Optional
 from decimal import Decimal
 from datetime import datetime
-from ..types.market_data import MarketData
+from ..types.market_types import MarketData
 from ..types.types import Position, TradeSignal
 from ..types.trading import RiskProfile, TradingMetrics
 from ..analysis.technical import TechnicalAnalyzer
