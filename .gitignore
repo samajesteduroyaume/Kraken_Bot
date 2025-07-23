@@ -1,0 +1,154 @@
+# Environnement virtuel Python
+.venv/
+venv/
+ENV/
+
+# Fichiers Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+build/
+develop-eggs/
+dist/
+downloads/
+eggs/
+.eggs/
+lib/
+lib64/
+parts/
+sdist/
+var/
+wheels/
+*.egg-info/
+.installed.cfg
+*.egg
+
+# Fichiers de configuration locaux
+.env
+.env.local
+.env.*.local
+!.env.example
+
+# Fichiers de base de données locale
+*.sqlite3
+*.db
+*.sql
+*.sqlite
+
+# Fichiers de cache
+.cache/
+.mypy_cache/
+.pytest_cache/
+.coverage
+htmlcov/
+
+# Fichiers de logs
+logs/
+*.log
+
+# Dossiers de données
+data/
+!data/README.md
+
+# Dossiers de modèles ML
+models/
+!models/README.md
+
+# Jupyter Notebook
+.ipynb_checkpoints
+*.ipynb
+
+# IDE
+.idea/
+.vscode/
+*.swp
+*.swo
+*~
+
+# Fichiers système
+.DS_Store
+Thumbs.db
+
+# Fichiers de configuration locaux
+config/local/
+!config/*.yaml
+!config/*.yml
+!config/*.json
+
+# Fichiers de rapport
+test-reports/
+coverage.xml
+*.cover
+
+# Fichiers temporaires
+tmp/
+temp/
+
+# Fichiers de documentation générés
+docs/_build/
+
+# Fichiers de déploiement
+.env.production
+.env.staging
+
+# Fichiers de cache Redis
+dump.rdb
+
+# Fichiers de sauvegarde
+*.bak
+*.backup
+
+# Fichiers de configuration spécifiques au projet
+kraken_bot_config.json
+
+# Fichiers de lock Python
+Pipfile.lock
+poetry.lock
+
+# Fichiers de dépendances Python
+requirements*.txt
+!requirements.txt
+
+# Fichiers de test unitaire
+.pytest_cache/
+.mypy_cache/
+
+# Fichiers de couverture de test
+.coverage
+htmlcov/
+
+# Fichiers de configuration de l'éditeur
+.vscode/
+!.vscode/settings.json
+!.vscode/tasks.json
+!.vscode/launch.json
+!.vscode/extensions.json
+
+# Fichiers de configuration de PyCharm
+.idea/
+
+# Fichiers de configuration de Jupyter
+.jupyter/
+
+# Fichiers de configuration de Docker
+.dockerignore
+Dockerfile
+.docker/
+
+# Fichiers de configuration Kubernetes
+k8s/
+
+# Fichiers de configuration Terraform
+.terraform/
+*.tfstate
+*.tfstate.*
+*.tfvars
+.terraform.lock.hcl
+
+# Fichiers de configuration de pré-commit
+.pre-commit-config.yaml
+
+# Fichiers de configuration de Black
+.pycaches/
