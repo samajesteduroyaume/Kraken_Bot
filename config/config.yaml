@@ -24,11 +24,11 @@ trading:
   - AAVE/USD
   min_score: 0.3
   min_volume: 1000000
-  risk_per_trade: 0.02
-  stop_loss_percent: 0.02
-  take_profit_percent: 0.04
-  max_positions: 2
-  max_drawdown: 0.1
+  risk_per_trade: 0.03  # 3% de risque par trade (équilibré pour 5 positions)
+  stop_loss_percent: 0.03  # Stop-loss à 3% (ajusté pour le risque par trade)
+  take_profit_percent: 0.06  # Take-profit à 6% (ratio 1:2)
+  max_positions: 5  # Augmenté à 5 positions maximum
+  max_drawdown: 0.15  # Drawdown maximum de 15% (ajusté pour plus de positions)
   max_holding_time: 86400
   max_concurrent_requests: 1
   analysis_timeout: 60.0

@@ -121,7 +121,11 @@ print_message "📝 Les logs seront enregistrés dans: ${LOG_FILE}"
     echo "Variables d'environnement chargées: $(grep -v '^#' .env | grep '=' | cut -d '=' -f 1 | tr '\n' ' ')"
     echo "=========================================="
     
+    # Ajout du répertoire src au PYTHONPATH
+    export PYTHONPATH="${SCRIPT_DIR}/src:${PYTHONPATH}"
+    
     # Lancement du bot
+    cd "${SCRIPT_DIR}/src"
     python3 -m kraken_bot
     
     EXIT_CODE=$?
